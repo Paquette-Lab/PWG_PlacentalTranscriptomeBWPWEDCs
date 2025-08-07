@@ -1,12 +1,13 @@
 This repository contains code from the Paquette Lab related to the manuscript, “The Placental Transcriptome Serves as a Mechanistic Link between Prenatal Phthalate Exposure and Placental Efficiency”. This documents presents a summary of code document names and purpose.
 
 Phthalate and Covariate Data Cleaning: 
+
 •	Phthalate_Covar_RNAseq_DataCleaning_N222.Rmd
-o	This code clean covariate data, RNAseq data, and phthalate data resulting in a final N=222 for phthalate RNAseq analyses.
+  	This code clean covariate data, RNAseq data, and phthalate data resulting in a final N=222 for phthalate RNAseq analyses.
 •	DEHP_DataCleaning.Rmd
-o	This code cleans and performs the geometric mean for DEHP data which was processed separately and then added back with the other phthalates data. It includes cleaning for the full and sex-stratified subsets. 
+    This code cleans and performs the geometric mean for DEHP data which was processed separately and then added back with the other phthalates data. It includes cleaning for the full and sex-stratified subsets. 
 •	Female_Phthalate_Covar_RNAseq_DataCleaning_N109.Rmd
-o	This code clean covariate data, RNAseq data, and phthalate data for a female subset of the sample resulting in a final N=109 for the female-stratified phthalate RNAseq analyses.
+    This code clean covariate data, RNAseq data, and phthalate data for a female subset of the sample resulting in a final N=109 for the female-stratified phthalate RNAseq analyses.
 •	Male_Phthalate_Covar_RNAseq_DataCleaning_N113.Rmd
 o	This code clean covariate data, RNAseq data, and phthalate data for a male subset of the sample resulting in a final N=113 for the male-stratified phthalate RNAseq analyses.
 Differential Expression Analysis Phthalates: 
