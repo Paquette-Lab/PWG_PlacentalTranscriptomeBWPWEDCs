@@ -1,0 +1,153 @@
+---
+title: "GAPPS_Phthalate_QGCompInterpretation"
+author: "Samantha Lapehn Young"
+date: "2025-07-14"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GAPPS QGComp Phthalate Mixtures Analysis Interpretation
+QGComp mixtures analysis was run for individual genes. Here I am pulling significant genes (using p<0.005) then making some plots to visualize the results. 
+
+### Load Packages
+```{r packages}
+library(tidyverse)
+library(qgcomp)
+library(data.table)
+library(edgeR)
+library(patchwork)
+
+#Loading the ewas_qgcomp source so that I can use some of the code to pull figures
+source("/Volumes/paquette_a/slapehn/OPE_and_PlacentalTranscriptome/EWAS_QGComp Code from Dennis/EWAS_QGComp_Functions_Update3.R")
+#Updated source code received 8/21/23 and should fix the output when using the "full" option for the main and bootstrap functions
+```
+
+### Load Data
+```{r data}
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/GAPPS_Phthalate_QGCompResults_071125.Rdata")
+Gene_QGCompFullResults <-ewas_qgcomp_fit.boot
+Gene_QGCompResults <- Gene_QGCompFullResults$results
+
+#Load for gene annotation purposes
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/gapps_20240325.Rdata")
+```
+
+### FDR Adjust
+Performing FDR adjustment of P-values
+```{r FDR Adjust}
+#FDR Adjust
+Gene_QGCompResults$FDR <- p.adjust(Gene_QGCompResults$pval, method="BH")
+
+```
+
+### Asessing significance threshold
+None of the individual genes meet an FDR<0.05, but there are 6 that meet p<0.001 which is what we used for the OPE manuscript. 
+There are no WGCNA modules with unadjusted p<0.05
+```{r}
+#Genes with FDR<0.05
+Gene_Results_FDR0.05 <- Gene_QGCompResults %>%
+  dplyr::filter(FDR<0.05)
+dim(Gene_Results_FDR0.05)
+#Genes with p<0.005 (Used p<0.001 for OPEs)
+Gene_Results_p0.005 <- Gene_QGCompResults %>%
+  dplyr::filter(pval<0.005)
+print(Gene_Results_p0.005)
+
+```
+
+```{r}
+ensembl_gene <- annot %>%
+  dplyr::select(ENSEMBL, SYMBOL)
+Gene_Results_p0.005 <- inner_join(Gene_Results_p0.005, ensembl_gene, by=c("probeID"="ENSEMBL"))
+GeneResults_SigTable <- Gene_Results_p0.005 %>%
+  dplyr::select(SYMBOL, probeID, beta, pval, FDR)
+colnames(GeneResults_SigTable)<-c("Gene Name", "Ensembl ID", 
+                                  "Effect Estimate", "P-Value", "FDR")
+```
+
+
+### Plot Component Effects for Figure
+```{r}
+CE <- Gene_QGCompFullResults$component_effects
+#Filter to just genes that had signficance
+CE_Sig <- CE %>%
+  dplyr::filter(CE$probeID %in% Gene_Results_p0.005$probeID)
+### Join with gene names
+CE_Sig <- inner_join(CE_Sig, ensembl_gene, by=c("probeID" = "ENSEMBL"))
+
+colnames(CE_Sig) <- c("probeID", "Phthalate", "Weight", "SYMBOL")
+
+CE_Sig$Phthalate <- toupper(CE_Sig$Phthalate)
+
+ggplot(CE_Sig, aes(x = Phthalate, y = Weight)) +
+  geom_col(aes(fill = Phthalate)) +
+  facet_wrap(~ SYMBOL, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Phthalate Metabolite", y = "Weight") + 
+  ylim(-0.8, 0.6)
+```
+
+### Plot frequency of component direction
+```{r}
+CE_Sig_Up <- CE_Sig %>%
+  dplyr::filter(Weight>0)
+
+CE_Sig_Down <- CE_Sig %>%
+  dplyr::filter(Weight<0)
+
+p1<-ggplot(CE_Sig_Down, aes(x = Phthalate, fill = Phthalate)) +
+  geom_bar() +
+  theme_bw() +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(
+    title = "Frequency of Negative Weights", 
+    subtitle = "For genes with p<0.005"
+  ) + 
+  ylab("Count") + 
+  xlab("Phthalate Metabolite")
+
+p2<-ggplot(CE_Sig_Up, aes(x = Phthalate, fill = Phthalate)) +
+  geom_bar() +
+  theme_bw() +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(
+    title = "Frequency of Positive Weights", 
+    subtitle = "For genes with p<0.005"
+  )+ 
+  ylab("Count") + 
+  xlab("Phthalate Metabolite")
+
+p1 + p2
+
+```
+
+### Rearrange the CE to add to main data
+```{r}
+wide_CE <- pivot_wider(
+  data = CE_Sig,
+  names_from = Phthalate,
+  values_from = Weight
+)
+
+### Join with Other Results
+SigResults_CE <- inner_join(Gene_Results_p0.005, wide_CE, by=c("probeID"))
+
+```
+
+### Save Results
+```{r save results}
+
+#write.csv(Gene_QGCompResults, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/GAPPS_Gene_UnfilteredQGCompResults_071125.csv")
+#write.csv(SigResults_CE, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/GAPPS_Gene_FilteredQGCompResults_p0.005_071125.csv")
+```
+
+
+

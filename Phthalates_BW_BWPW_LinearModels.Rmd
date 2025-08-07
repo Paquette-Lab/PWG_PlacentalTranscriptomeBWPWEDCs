@@ -1,0 +1,239 @@
+---
+title: "Phthalates, BW, and BW:PW"
+author: "Alison Paquette & Samantha Lapehn"
+date: "05/08/25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+### GAPPS: Phthalates, BW, BW:PW Project
+Here we are performing analysis to identify associations between phthalates, BW and BW:PW ratio in the GAPPS cohort. Separately, we have identified placental transcriptomic signature of these exposures/outcomes and performed a mediation analysis for overlapping signatures. 
+
+#### Load Packages
+```{r load packages}
+library(tidyverse)
+library(patchwork)
+```
+
+
+#### Load Data
+```{r load data}
+#load Cleaned Covariate Data
+load("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FinalCovariates_N222_041525.RData")
+
+#load other covariate which will have the birthweight data
+full_covar<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4_15_2024/req_05_data.csv")
+                        
+rownames(full_covar)<-(full_covar$pathways_id)
+
+
+
+#Phthalates data
+PHT<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Phthalate_CleanedLogData_GeoMean_LN_N222_041525.csv")
+colnames(PHT) <- toupper(colnames(PHT))
+DEHP<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_N222_050825.csv")
+colnames(DEHP) <- c("X", "pathways_id", "DEHP")
+rownames(DEHP) <- DEHP$pathways_id
+
+PHT <- inner_join(PHT, DEHP, by=c("X"="pathways_id"))
+rownames(PHT) <- PHT$X
+PHT <- PHT %>%
+  dplyr::select(-X, -X.y)
+```
+
+#### Add BW to Covars
+```{r BW to covars}
+BW <- full_covar %>%
+  dplyr::select(pathways_id, h_birthweight_g)
+
+covar_final <- inner_join(covar_final, BW, by=c("pathways_id"))
+
+```
+
+### Filter participants
+Only including participants with phthalate data, BW data, and BW:PW data
+```{r filter particiapnts}
+dim(covar_final)
+covar_final_filtered <- na.omit(covar_final)
+dim(covar_final_filtered)
+
+PHT_Filtered <- PHT %>% 
+  dplyr::filter(row.names(PHT) %in% covar_final_filtered$pathways_id)
+
+sum(rownames(PHT_Filtered)==covar_final_filtered$pathways_id)
+
+#Remove participant g1200711 since they have an NA for hypertensive disorder and were excluded from other placental efficiency analyses
+
+covar_final_filtered <- covar_final_filtered %>%
+  dplyr::filter(!pathways_id %in% c("g1200711"))
+
+PHT_Filtered <- PHT_Filtered %>%
+  dplyr::filter(row.names(PHT_Filtered) %in% covar_final_filtered$pathways_id)
+
+sum(rownames(PHT_Filtered)==covar_final_filtered$pathways_id)
+```
+
+### Scale Placental Weight and Calculate Summary Statistics
+Summary statistics are needed to set the spline knots
+
+```{r scale PW}
+#unscaled PW
+summary(covar_final_filtered$m_pl1_weight)
+#Scaled PW
+covar_final_filtered$scaled_PW <- as.numeric(scale(covar_final_filtered$m_pl1_weight))
+summary(covar_final_filtered$scaled_PW)
+
+knots <- c(-0.60980, 0.00497, 0.53831)
+```
+
+### Linear Regression Models-BW
+```{r BW Models}
+PHT_BW<-data.frame(matrix(NA,nrow=16,ncol=4))
+
+for(i in 1:16){
+PDat<-PHT_Filtered[,i]
+BWModel<-lm(covar_final_filtered$h_birthweight_g~PDat+
+              covar_final_filtered$h_c_sex + 
+              covar_final_filtered$h_m_delivery_age + 
+              covar_final_filtered$race_collapsed + 
+              covar_final_filtered$h_m_prepreg_bmi + 
+              covar_final_filtered$labor_collapsed + 
+              covar_final_filtered$h_del_method + 
+              covar_final_filtered$parity_20 + 
+              covar_final_filtered$h_m_ethn + 
+              covar_final_filtered$edu_collapsed + 
+              covar_final_filtered$smoking_composite + 
+              splines::ns(covar_final_filtered$scaled_PW, knots=knots) + 
+              covar_final_filtered$SG)
+tmp<-summary(BWModel)
+PHT_BW[i,]<-tmp$coefficients[2,]
+}
+rownames(PHT_BW)<-colnames(PHT_Filtered)[1:16]
+colnames(PHT_BW)<-c("Estimate","StdError","t value","p")
+
+#Add 95% CI for forest plot
+PHT_BW <- PHT_BW %>%
+  mutate(
+    Lower = Estimate - 1.96 * StdError,
+    Upper = Estimate + 1.96 * StdError,
+    p_group = case_when(
+      p < 0.05 ~ "< 0.05",
+      p < 0.1 ~ "0.05 - 0.1",
+      TRUE ~ "≥ 0.1"
+    )
+  ) %>%
+  arrange(p)
+
+
+print(PHT_BW)
+
+
+
+PHT_BW$Chemical <- rownames(PHT_BW)
+
+PHT_BW$Chemical <- factor(PHT_BW$Chemical, levels = sort(unique(PHT_BW$Chemical), decreasing=TRUE))
+
+PHT_BW$p_group <- factor(PHT_BW$p_group, levels = c("< 0.05", "0.05 - 0.1", "≥ 0.1"))
+```
+
+### Linear Regression Models-BW:PW
+```{r BW:PW Model}
+PHT_BW_PW<-data.frame(matrix(NA,nrow=16,ncol=4))
+
+for(i in 1:16){
+PDat<-PHT_Filtered[,i]
+BWPWModel<-lm(covar_final_filtered$fetal_placental_ratio~PDat+
+                covar_final_filtered$h_c_sex + 
+                covar_final_filtered$h_m_delivery_age + 
+                covar_final_filtered$race_collapsed + 
+                covar_final_filtered$h_m_prepreg_bmi + 
+                covar_final_filtered$labor_collapsed + 
+                covar_final_filtered$h_del_method + 
+                covar_final_filtered$parity_20 + 
+                covar_final_filtered$h_m_ethn + 
+                covar_final_filtered$edu_collapsed + 
+                covar_final_filtered$smoking_composite + 
+                covar_final_filtered$SG)
+tmp<-summary(BWPWModel)
+PHT_BW_PW[i,]<-tmp$coefficients[2,]
+}
+rownames(PHT_BW_PW)<-colnames(PHT_Filtered)[1:16]
+colnames(PHT_BW_PW)<-c("Estimate","StdError","t value","p")
+
+#Add 95% CI for forest plot
+PHT_BW_PW <- PHT_BW_PW %>%
+  mutate(
+    Lower = Estimate - 1.96 * StdError,
+    Upper = Estimate + 1.96 * StdError,
+    p_group = case_when(
+      p < 0.05 ~ "< 0.05",
+      p < 0.1 ~ "0.05 - 0.1",
+      TRUE ~ "≥ 0.1"
+    )
+  ) %>%
+  arrange(p)
+
+
+print(PHT_BW_PW)
+
+PHT_BW_PW$Chemical <- rownames(PHT_BW_PW)
+
+PHT_BW_PW$Chemical <- factor(PHT_BW_PW$Chemical, levels = sort(unique(PHT_BW_PW$Chemical),decreasing=TRUE))
+
+PHT_BW_PW$p_group <- factor(PHT_BW_PW$p_group, levels = c("< 0.05", "0.05 - 0.1", "≥ 0.1"))
+
+```
+
+### Forest Plots
+```{r forest plots}
+
+BWplot <- ggplot(PHT_BW, aes(x = Estimate, y = Chemical)) +
+  geom_point(aes(color = p_group), size = 3) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.2, color = "gray40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal(base_size = 12) +
+  scale_color_manual(
+    values = c(
+      "< 0.05" = "#1b9e77",    
+      "0.05 - 0.1" = "#7570b3",
+      "≥ 0.1" = "gray60"
+    ),
+    name = "p-value"
+  ) +
+  labs(
+    title =expression("Birthweight"["adj"]*" (g)"),
+    x = "Beta Coefficient (95% CI)",
+    y = "Phthalate Metabolite"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    legend.position = "right"
+  )
+
+BWPWplot <- ggplot(PHT_BW_PW, aes(x = Estimate, y = Chemical)) +
+  geom_point(aes(color = p_group), size = 3) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.2, color = "gray40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal(base_size = 12) +
+  scale_color_manual(
+    values = c(
+       "< 0.05" = "#1b9e77",    
+      "0.05 - 0.1" = "#7570b3",
+      "≥ 0.1" = "gray60"
+    ),
+    name = "p-value"
+  ) +
+  labs(
+    title = "Birthweight:Placental Weight",
+    x = "Beta Coefficient (95% CI)",
+    y = "Phthalate Metabolite"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    legend.position = "none"
+  )
+
+BWPWplot + BWplot
+```
+

@@ -1,0 +1,239 @@
+---
+title: "GAPPS_Phthalate_QGCompInterpretation"
+author: "Samantha Lapehn"
+date: "2025-07-15"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GAPPS QGComp Phthalate Mixtures Analysis Interpretation- Sex Stratified
+QGComp mixtures analysis was run for individual genes in the sex stratified analysis. Here we are pulling and plotting significant results (using p<0.005).
+
+### Load Packages
+```{r packages}
+library(tidyverse)
+library(patchwork)
+```
+
+### Load Data
+```{r data}
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Male/Male_GAPPS_Phthalate_QGCompResults_GeoMean_071125.Rdata")
+Male_QGCompFullResults <-ewas_qgcomp_fit.boot
+Male_QGCompResults <- Male_QGCompFullResults$results
+
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Female/Female_GAPPS_Phthalate_QGCompResults_071625.Rdata")
+Female_QGCompFullResults<-ewas_qgcomp_fit.boot
+Female_QGCompResults <- Female_QGCompFullResults$results
+
+#Load for gene annotation purposes
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/gapps_20240325.Rdata")
+```
+
+### FDR Adjust
+Performing FDR adjustment of P-values
+```{r FDR Adjust}
+#FDR Adjust
+Male_QGCompResults$FDR <- p.adjust(Male_QGCompResults$pval, method="BH")
+Female_QGCompResults$FDR <- p.adjust(Female_QGCompResults$pval, method="BH")
+```
+
+### Asessing significance threshold
+None of the individual genes meet an FDR<0.05, Using p<0.005 for mixtures analysis "provisional significance"
+```{r}
+#Male with FDR<0.05
+Male_Results_FDR0.05 <- Male_QGCompResults %>%
+  dplyr::filter(FDR<0.05)
+dim(Male_Results_FDR0.05)
+#Genes with p<0.005 (Used p<0.001 for OPEs)
+Male_Results_p0.005 <- Male_QGCompResults %>%
+  dplyr::filter(pval<0.005)
+print(Male_Results_p0.005)
+
+#Female with FDR<0.05
+Female_Results_FDR0.05 <- Female_QGCompResults %>%
+  dplyr::filter(FDR<0.05)
+dim(Female_Results_FDR0.05)
+#Female with p<0.005 (Used p<0.001 for OPEs)
+Female_Results_p0.005 <- Female_QGCompResults %>%
+  dplyr::filter(pval<0.005)
+print(Female_Results_p0.005)
+```
+
+### Organize Sig Results
+Using p<0.005 for significance
+```{r}
+#Annotate with gene symbols
+ensembl_gene <- annot %>%
+  dplyr::select(ENSEMBL, SYMBOL)
+Male_Results_p0.005 <- inner_join(Male_Results_p0.005, ensembl_gene, by=c("probeID"="ENSEMBL"))
+MaleResults_SigTable <- Male_Results_p0.005 %>%
+  dplyr::select(SYMBOL, probeID, beta, pval, FDR)
+colnames(MaleResults_SigTable)<-c("Gene Name", "Ensembl ID", 
+                                  "Effect Estimate", "P-Value", "FDR")
+MaleResults_SigTable$FetalSex <- c("Male")
+
+Female_Results_p0.005 <- inner_join(Female_Results_p0.005, ensembl_gene, by=c("probeID"="ENSEMBL"))
+FemaleResults_SigTable <- Female_Results_p0.005 %>%
+  dplyr::select(SYMBOL, probeID, beta, pval, FDR)
+colnames(FemaleResults_SigTable)<-c("Gene Name", "Ensembl ID", 
+                                  "Effect Estimate", "P-Value", "FDR")
+FemaleResults_SigTable$FetalSex <- c("Female")
+
+SexStrat_SigResultsTable <-rbind(MaleResults_SigTable, FemaleResults_SigTable)
+
+```
+
+### Pull Component Effects for Table- Male
+```{r}
+CE_Male <- Male_QGCompFullResults$component_effects
+#Filter to just genes that had signficance
+CE_Sig_Male <- CE_Male %>%
+  dplyr::filter(CE_Male$probeID %in% Male_Results_p0.005$probeID)
+### Join with gene names
+CE_Sig_Male <- inner_join(CE_Sig_Male, ensembl_gene, by=c("probeID" = "ENSEMBL"))
+
+colnames(CE_Sig_Male) <- c("probeID", "Phthalate", "Weight", "SYMBOL")
+
+CE_Sig_Male$Phthalate <- toupper(CE_Sig_Male$Phthalate)
+
+ggplot(CE_Sig_Male, aes(x = Phthalate, y = Weight)) +
+  geom_col(aes(fill = Phthalate)) +
+  facet_wrap(~ SYMBOL, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Phthalate Metabolite", y = "Weight") + 
+  ylim(-0.8, 0.6)
+```
+
+### Pull Component Effects for Table- Female
+```{r}
+CE_Female <- Female_QGCompFullResults$component_effects
+#Filter to just genes that had signficance
+CE_Sig_Female <- CE_Female %>%
+  dplyr::filter(CE_Female$probeID %in% Female_Results_p0.005$probeID)
+### Join with gene names
+CE_Sig_Female <- inner_join(CE_Sig_Female, ensembl_gene, by=c("probeID" = "ENSEMBL"))
+
+colnames(CE_Sig_Female) <- c("probeID", "Phthalate", "Weight", "SYMBOL")
+
+CE_Sig_Female$Phthalate <- toupper(CE_Sig_Female$Phthalate)
+
+ggplot(CE_Sig_Female, aes(x = Phthalate, y = Weight)) +
+  geom_col(aes(fill = Phthalate)) +
+  facet_wrap(~ SYMBOL, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Phthalate Metabolite", y = "Weight") + 
+  ylim(-0.8, 0.6)
+```
+
+### Plot frequency of component direction
+```{r}
+CE_Sig_Up_Male <- CE_Sig_Male %>%
+  dplyr::filter(Weight>0)
+
+CE_Sig_Down_Male <- CE_Sig_Male %>%
+  dplyr::filter(Weight<0)
+
+p1_Male<-ggplot(CE_Sig_Down_Male, aes(x = Phthalate, fill = Phthalate)) +
+  geom_bar() +
+  theme_bw() +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(
+    title = "Frequency of Negative Weights", 
+    subtitle = "For genes with p<0.005"
+  ) + 
+  ylab("Count") + 
+  xlab("Phthalate Metabolite")
+
+p2_Male<-ggplot(CE_Sig_Up_Male, aes(x = Phthalate, fill = Phthalate)) +
+  geom_bar() +
+  theme_bw() +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(
+    title = "Frequency of Positive Weights", 
+    subtitle = "For genes with p<0.005"
+  )+ 
+  ylab("Count") + 
+  xlab("Phthalate Metabolite")
+
+p1_Male + p2_Male
+
+```
+
+### Plot frequency of component direction - Female
+```{r}
+CE_Sig_Up_Female <- CE_Sig_Female %>%
+  dplyr::filter(Weight>0)
+
+CE_Sig_Down_Female <- CE_Sig_Female %>%
+  dplyr::filter(Weight<0)
+
+p1_Female<-ggplot(CE_Sig_Down_Female, aes(x = Phthalate, fill = Phthalate)) +
+  geom_bar() +
+  theme_bw() +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(
+    title = "Frequency of Negative Weights", 
+    subtitle = "For genes with p<0.005"
+  ) + 
+  ylab("Count") + 
+  xlab("Phthalate Metabolite")
+
+p2_Female<-ggplot(CE_Sig_Up_Female, aes(x = Phthalate, fill = Phthalate)) +
+  geom_bar() +
+  theme_bw() +
+  xlab(NULL) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(
+    title = "Frequency of Positive Weights", 
+    subtitle = "For genes with p<0.005"
+  )+ 
+  ylab("Count") + 
+  xlab("Phthalate Metabolite")
+
+p1_Female + p2_Female
+
+```
+
+### Rearrange the CE to add to main data
+```{r}
+wide_CE_Male <- pivot_wider(
+  data = CE_Sig_Male,
+  names_from = Phthalate,
+  values_from = Weight
+)
+
+wide_CE_Female <- pivot_wider(
+  data = CE_Sig_Female,
+  names_from = Phthalate,
+  values_from = Weight
+)
+
+### Join with Other Results
+SigResults_CE_Male <- inner_join(Male_Results_p0.005, wide_CE_Male, by=c("probeID"))
+SigResults_CE_Female <- inner_join(Female_Results_p0.005, wide_CE_Female, by=c("probeID"))
+
+### Combine Sig Results
+SigResults_CE_Male$Sex <- "Male"
+SigResults_CE_Female$Sex <- "Female"
+SexStrat_SigResultsTable <- rbind(SigResults_CE_Male, SigResults_CE_Female)
+```
+
+### Save Results
+Saving unfiltered results here
+```{r save results}
+#write.csv(Male_QGCompResults, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Male/GAPPS_Male_UnfilteredQGCompResults_071525.csv")
+#write.csv(Female_QGCompResults, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Female/GAPPS_Female_UnfilteredQGCompResults_071625.csv")
+#write.csv(SexStrat_SigResultsTable, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/GAPPS_SexStratified_FilteredQGCompResults_withCE_p0.005_071625.csv")
+```
+
+

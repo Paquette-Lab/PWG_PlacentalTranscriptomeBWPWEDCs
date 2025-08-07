@@ -1,0 +1,136 @@
+---
+title: "Female GAPPS: Placental Gene Expression and Phthalate Exposures"
+author: "Samantha Lapehn and Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Female-Stratified Differential Expression and Pathway Analysis for GAPPS Phthalates and Placental Transcriptome
+This code performs the RNAseq analysis for associations between phthalates and the placental transcriptome in a female-stratified subset (N=109) of the sample. We used FDR<0.05 for gene significance. 
+
+
+### Load Libraries
+
+```{r load packages}
+library(tidyverse)
+library(here)
+library(assertthat)
+library(edgeR)
+library(RColorBrewer)
+library(kableExtra) 
+library(RUVSeq) 
+library(ggrepel)
+library(biomaRt)
+library(org.Hs.eg.db)
+```
+
+#### Load Data
+
+```{r load data}
+## Filterd and Normalized RNAseq
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Female/Female_FilteredNormalizedRNAseq_N109_041625.RData")
+
+## Filtered and Natural Log Transformed Phthalate Data
+PHT_noDEHP <-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Female/Female_Phthalate_CleanedLogData_GeoMean_LN_N109_041625.csv")
+
+DEHP <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_Female_N109_050825.csv")
+
+PHT <- inner_join(PHT_noDEHP, DEHP, by=c("X"="pathways_id"))
+
+rownames(PHT) <- PHT$X
+PHT <- PHT %>%
+  dplyr::select(-X, -X.y)
+
+## Filtered covariates
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Female/Female_FinalCovariates_N109_041625.Rdata")
+covars <- covar_final
+covars <- data.frame(covars)
+rownames(covars) <- covars$pathways_id
+
+sum(rownames(PHT) == rownames(covars))
+
+#Combine Covar + Phthalates
+covar_PHT <- merge(covars, PHT, by='row.names')
+covar_PHT$batch <- factor(covar_PHT$batch, levels=c("1", "2", "3"))
+summary(covar_PHT$batch)
+```
+
+### Differential Gene Expression Analysis
+
+```{r DEGanalysis}
+all_PHT_results <- lapply(colnames(PHT)[1:16], function(phthalate) {
+    ## first, build mod using get function
+  mod <- with(covar_PHT, 
+              model.matrix(~ get(phthalate) + 
+                               labor_collapsed +
+                               h_del_method +
+                               h_m_delivery_age + 
+                              h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               parity_20 + 
+                              SG + 
+                             smoking_composite + 
+                             batch
+                             ))
+  
+  ## now, limma-voom
+  v <- voom(Y_norm, mod, plot = TRUE)  
+  designMatrix <- v$design
+  fit <- eBayes(lmFit(v, designMatrix))
+
+  ## get results (remember, we want coef 2) and turn into a tibble
+  res_PHT <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH") %>%
+    as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_id")) %>%
+    dplyr::mutate(Phthalate = phthalate) %>%
+    dplyr::relocate(Phthalate)
+  
+  }) %>%
+  dplyr::bind_rows() 
+
+lapply(colnames(PHT)[1:16], function(phthalate) {
+  temp <- all_PHT_results %>%
+    dplyr::filter(Phthalate == phthalate)
+  
+  tibble(Phthalate = phthalate, 
+         `FDR<0.05` = sum(temp$adj.P.Val<0.05),
+         `FDR<0.10` = sum(temp$adj.P.Val<0.1),
+         `FDR<0.20` = sum(temp$adj.P.Val<0.2),
+         `P<0.005` =  sum(temp$P.Value<0.005))
+  }) %>%
+  dplyr::bind_rows() %>%
+  kable() %>%
+  kableExtra::kable_styling()
+```
+
+
+### Plotting p-values
+```{r fig.width=10, fig.height=10}
+all_PHT_results$Phthalate <- toupper(all_PHT_results$Phthalate)
+ggplot(all_PHT_results, aes(x = P.Value)) +
+  geom_histogram(bins = 20, fill = "grey") +
+  geom_hline(yintercept = 13156/20, linetype = "dashed", color = "tomato") +
+  theme_classic() +
+  facet_wrap(. ~ Phthalate, scales = "fixed")
+```
+
+### Make Phthalate DEG Table
+```{r phthalate dEG table}
+#Filter for signficant data
+sig_PHT_results <- all_PHT_results %>%
+  dplyr::filter(adj.P.Val<0.05)
+#Export to reformat as DEG table
+#Note: No DEGs here to export
+```
+
+
+### Save All Results
+```{r save results}
+#write.csv(all_PHT_results,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Female/Female_Phthalate_AllResults_071025.csv")
+
+```
+
+

@@ -1,0 +1,105 @@
+---
+title: "DEHP Data Cleaning 050825"
+author: "Samantha Lapehn"
+date: "2025-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## DEHP Data Cleaning
+
+Here I am cleaning GAPPS DEHP data to add to the rest of the GAPPS Phthalate analysis. Will save DEHP versions for full, male, and female analyses. 
+
+### Load Packages
+
+```{r load packages}
+library(tidyverse)
+
+```
+
+### Load Data
+```{r load data}
+#Raw Exposure Data
+PrenatalExposures<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4-9-2024/req_05_biomarkers.csv")
+
+#Final Clean Covariates- will use this filter DEHP to only participants with full covariates and RNAseq data
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FinalCovariates_N222_041525.Rdata")
+
+#Male/Female Covar Subsets
+covar_final_M<- covar_final %>%
+  dplyr::filter(h_c_sex =="M")
+covar_final_F<-covar_final %>%
+  dplyr::filter(h_c_sex =="F")
+```
+
+### Select DEHP
+Here we are using the DEHP variable (dehp2) which is the version calculated from the molar sum of 5 metabolites. (This is confirmed in 08/06/24 email with Alison + Brennan). The dehp1 version is the molar sum of only 4 mertabolites.  
+
+dehp1 = (mehp * (1/278.34)) + (mehhp * (1/294.34)) + (meohp * (1/292.33)) + (mecpp *(1/308.33)). 
+
+
+dehp2 = (mehp * (1/278.34)) + (mehhp * (1/294.34)) + (meohp * (1/292.33)) + (mecpp *(1/308.33)) + (mcmhp*(1/308.33))  
+```{r select DEHP}
+DEHP <- PrenatalExposures %>%
+  dplyr::select(pathways_id, dehp2, phthalate_contact_type)
+
+```
+
+### Filter for full covariates
+```{r filter for full covariates}
+DEHP_fullcovar <- DEHP %>%
+  dplyr::filter(pathways_id %in% covar_final$pathways_id) %>%
+  dplyr::select(-phthalate_contact_type)
+
+DEHP_fullcovar_F <- DEHP %>%
+  dplyr::filter(pathways_id %in% covar_final_F$pathways_id) %>%
+  dplyr::select(-phthalate_contact_type)
+
+DEHP_fullcovar_M <- DEHP %>%
+  dplyr::filter(pathways_id %in% covar_final_M$pathways_id) %>%
+  dplyr::select(-phthalate_contact_type)
+```
+
+### DEHP - Geometric Mean across visits
+Here we are applying a geometric mean to combine DEHP measurements for participants with more than one
+```{r combine DEHP}
+gm_mean <- function(a) {
+  prod(a, na.rm = TRUE)^(1/length(a))
+}
+# Aggregate using geomtric mean
+DEHP_Av <- aggregate(. ~ pathways_id, data = DEHP_fullcovar, FUN = gm_mean)
+
+DEHP_Av_F<-aggregate(. ~ pathways_id, data = DEHP_fullcovar_F, FUN = gm_mean)
+
+DEHP_Av_M <-aggregate(. ~ pathways_id, data = DEHP_fullcovar_M, FUN = gm_mean)
+
+summary(DEHP_Av$dehp2)
+
+#Make nM version 
+DEHP_nM <- DEHP_Av
+DEHP_nM$dehp2 <- DEHP_nM$dehp2*1000
+
+#Log Transform- Using a natural log transformation
+DEHP_Av$dehp2 <- log(DEHP_Av$dehp2)
+DEHP_Av_F$dehp2 <- log(DEHP_Av_F$dehp2)
+DEHP_Av_M$dehp2 <- log(DEHP_Av_M$dehp2)
+
+DEHP_nM$dehp2 <- log(DEHP_nM$dehp2)
+```
+
+### Save DEHP Data
+```{r DEHP save}
+#write.csv(DEHP_Av,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_N222_050825.csv")
+
+#write.csv(DEHP_Av_F, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_Female_N109_050825.csv")
+#write.csv(DEHP_Av_M,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_Male_N113_050825.csv")
+
+#write.csv(DEHP_nM,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_nMVersion_Clean_N222_050825.csv")
+```
+
+
+
+

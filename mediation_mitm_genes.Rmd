@@ -1,0 +1,700 @@
+---
+title: "Formal mediation with meet-in-the-middle genes"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+Aim: Using the Meet In The Middle (MITM) genes that are associated with at least 1 phthalate metabolite (FDR<0.05) AND at least one placental efficiency outcome (BW~adj~ or BW:PW ratio), conduct formal mediation analysis. Note that there are no MITM genes for placental weight (PW). 
+
+##### Load Libraries
+
+```{r}
+library(tidyverse)
+library(here)
+library(assertthat)
+library(kableExtra)
+library(arsenal)
+library(edgeR)
+library(splines)
+library(mediation)
+library(parallel)
+library(ggtext)
+```
+
+#### Load Data
+
+Get meet-in-the-middle gene pairs first
+
+```{r}
+Dat <- readr::read_csv(here::here("Mariana/Draft3/CIRCOS_and_MITMmediation/circos_MITM_sigResults_20250710.csv")) |>
+  ## remove unneeded columns
+  dplyr::select(-c("Sector", "Track_Sublevel")) |>
+  ## filter to only include significant results
+  dplyr::filter(FDR<0.05) |>
+  dplyr::filter(Track_Analysis == "Overall") |>
+  ## arrange by sector (chemical class) and metabolite
+  dplyr::arrange(SECTOR, Metabolite, Track_Analysis) |> 
+  ## convert sector to factor 
+  dplyr::mutate(
+    Sector = factor(SECTOR, levels = c("PW", "BWadj", "BW:PW", "Phthalate"))
+  ) |>
+  ## assign unique x_position within each sector based on metabolite order
+  dplyr::mutate(
+    x_position = ave(seq_along(Metabolite), Sector, FUN = seq_along),
+    logFC = dplyr::if_else(Sector == "PW", 0, logFC)
+  ) 
+
+shared_genes <- intersect(
+  Dat$genes[Dat$Sector == "Phthalate"],
+  Dat$genes[Dat$Sector %in% c("BWadj", "BW:PW", "PW")]
+)
+
+Dat |>
+  dplyr::filter(genes %in% shared_genes) |>
+  dplyr::arrange(genes, Sector) |>
+  dplyr::select(genes, logFC, FDR, Sector, Metabolite) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+Load the data
+
+```{r}
+## load RNA seq
+load(here::here("Resubmission_July2024/NEW_RawData/gapps_20240325.Rdata"))
+
+## load full covariate data
+full_covar <- read_csv(file = here::here("Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4_25_2024/req_05_data.csv"))
+
+## load birthweight Z score data, which also has calculated placental_fetal_weight ratio
+zscores <- read_csv(file = here::here("Resubmission_July2024", "intermediateData", "all_birthweightZscores_fetalPlacentalRatios.csv"))
+
+## load this for cotinine values
+## values are already log-transformed for cotinine
+load("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/intermediateData/CleanedExposureData_AGP_April192024.RData")
+rm(PAH, PHT)
+
+## load exposure
+## values are already log-transformed
+PHTH <- read_csv(here::here("Sam/Data/Phthalate_CleanedLogData_GeoMean_LN_N222_041525.csv"))
+
+DEHP <- read_csv(here::here("Mariana/clean_data/DEHP_Clean_N222_050825.csv"))
+
+colnames(PHTH)[1] <- "pathways_id"
+
+load("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FinalCovariates_N222_041525.Rdata")
+sg <- covar_final
+rm(covar_final)
+
+PHTH <- PHTH |>
+  dplyr::full_join(sg |> dplyr::select(pathways_id, SG)) |>
+  dplyr::full_join(DEHP |> dplyr::select(pathways_id, dehp = dehp2))
+```
+
+# Covariate Cleaning
+
+First, we need to attach the RNA-sequencing analysis batch and birthweight z-scores to the covariate data. 
+
+```{r}
+## attach batches to covar
+## match batches data to pathways_id 
+## code from Alison's CRH analysis in CANDLE 
+## CRH_PreliminaryDataPreprocessing_3102023.Rmd
+batches$pathways_id <- colnames(counts$counts)
+
+covar <- dplyr::full_join(full_covar, 
+                          ## join batches
+                          batches |> dplyr::select(c(pathways_id, batch = Analysis)),
+                          by = join_by(pathways_id)) |>
+  ## join fetal placental ratio from z-scores
+  dplyr::full_join(zscores |> dplyr::select(pathways_id, fetal_placental_ratio, 
+                                             placenta_weight = m_pl1_weight, 
+                                             birthweight = h_birthweight_g), 
+                   by = join_by(pathways_id)) |>
+  dplyr::full_join(Cotinine |> dplyr::select(pathways_id, cotinine, cotinine_yn),
+                   by = join_by(pathways_id))
+```
+
+Second, we need to remove the `8888` codings for NAs and convert them to `NA` that R can interpret.
+
+```{r}
+covar <- covar |>
+   mutate(across(where(is.numeric), ~ na_if(., 8888)))
+```
+
+Third, we need to generate the cleaned hypertension and gestation diabetes variables. 
+
+```{r}
+covar_old <- covar |>
+  dplyr::filter(mra_protocol == 0) |>
+  dplyr::mutate(
+    ## make chronic hypertension variable
+    chronic_htn = dplyr::if_else(mra_old_m_category___12 == 1 | mra_old_m_medical_history___3 == 1, 1, 0),
+    ## now make hypertensive disorders of pregnancy variable
+    ## NAs from new protocol are retained
+    htn_pregnancy = dplyr::if_else(h_preeclam_currpreg == 1 | h_gesthtn_currpreg == 1 | chronic_htn == 1,
+                              1, 0),
+    ## now make GDM variable
+    gdm = dplyr::if_else(mra_old_m_diabete_type == 3 & is.na(mra_old_m_diabete_type) == FALSE, 1, 0)
+  )
+
+covar_new <- covar |>
+  dplyr::filter(mra_protocol == 1) |>
+  dplyr::mutate(
+    ## make chronic hypertension variable
+    chronic_htn = dplyr::if_else(mra_new_m_category___12 == 1, 1, 0),
+    ## now make hypertensive disorders of pregnancy variable
+    ## NAs from old protocol are retained
+    htn_pregnancy = dplyr::if_else(h_preeclam_currpreg == 1 | h_gesthtn_currpreg == 1 | chronic_htn == 1,
+                              1, 0),
+    ## now make GDM variable
+    gdm = dplyr::if_else(mra_new_m_category___53 == 1 & is.na(mra_new_m_category___53) == FALSE, 1, 0)
+  )
+
+covar_cleaned <- dplyr::bind_rows(covar_old, covar_new) 
+```
+
+Now, filter based on exclusion criteria.
+
+```{r filterMissingRNAseq}
+dim(covar_cleaned)
+
+covar_rnaseq <- covar_cleaned |>
+  ## n = 702
+  dplyr::distinct() |>
+  ## n = 701
+  ## remove the duplicates in the fourth batch for now (arrange by batch, 
+  ## then take only the first sample)
+  dplyr::arrange(batch) |>
+  dplyr::group_by(pathways_id) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  ## n = 673
+  dplyr::filter(pathways_id %in% colnames(lengthScaledTPM$counts)) |>
+  # n = 465
+  ## also remove multifetal gestations and abruptions
+  dplyr::filter(h_placental_abrupt == 0 | is.na(h_placental_abrupt) == TRUE) |>
+  ## n = 425; 451 when retaining NAs
+  dplyr::filter(h_multi_gest == 0 | is.na(h_multi_gest) == TRUE) |>
+  ## n = 413; 438 when retaining NAs
+  ## some issues with unreasonable maternal BMIs (= 0)
+  dplyr::filter(h_m_prepreg_bmi > 0 | is.na(h_m_prepreg_bmi) == TRUE) |>
+  ## n = 436
+  dplyr::mutate(smoking_composite = dplyr::case_when(
+    ## if self-report, yes
+    h_m_enroll_smoke == 1 ~ 1, 
+    ## if self-report no or no report but cotinine == yes, yes
+    (h_m_enroll_smoke == 0 | is.na(h_m_enroll_smoke) == TRUE) & cotinine_yn == 1 ~ 1, 
+    ## if self-report no and cotinine == no or cotinine is NA, no
+    h_m_enroll_smoke == 0 & (is.na(cotinine_yn) == TRUE | cotinine_yn == 0) ~ 0, 
+    ## else, everything must be NA, so NA
+    is.na(h_m_enroll_smoke) == TRUE & (is.na(cotinine_yn) == TRUE | cotinine_yn == 0) ~ 8888
+    ) |> na_if(8888)) 
+
+dim(covar_rnaseq)
+```
+
+Now, let's format the factors (add labels and orders) as needed. 
+
+```{r}
+covar_rnaseq <- within(covar_rnaseq, {
+  protocol <- factor(protocol, labels = c("Old", "New"))
+  mra_protocol <- factor(mra_protocol, labels = c("Old", "New"))
+  site <- factor(site, labels = c("UW", "Swedish", "Yakima"))
+  h_c_sex <- factor(h_c_sex) %>% ## relevel
+    relevel(ref = "M") ## more males than females
+  h_m_race <- factor(h_m_race, labels = c("White", "Black_AA", "Asian",
+                                          "NI_AN", "Multiple", "Other"))
+  race_collapsed <- dplyr::if_else(h_m_race %in% c("NI_AN", "Multiple"), 
+                                   "Other", 
+                                   h_m_race) |> 
+    factor() |>
+    relevel(ref = "White")
+  h_m_ethn <- factor(h_m_ethn, labels = c("Not Hispanic", "Hispanic or Latino"))
+  h_m_enroll_educ <- factor(h_m_enroll_educ, labels =  c("<HS", "HS graduate", "Graduated college/technical school", "Some graduate work or degree")) |> ## college grad is largest group
+    relevel(ref = "Graduated college/technical school")
+  edu_collapsed <- dplyr::if_else(h_m_enroll_educ %in% c("Graduated college/technical school", "Some graduate work or degree"),
+                                  0,  ## college graduate or higher as reference
+                                  1) |>
+    factor()
+  h_m_enroll_smoke <- factor(h_m_enroll_smoke, labels = c("No", "Yes"))
+  smoking_composite <- factor(smoking_composite, labels = c("No", "Yes"))
+  cg_labor_type <- factor(cg_labor_type, labels = c("Spontaneous", "Augmented", "Induced", "No labor"))
+  labor_collapsed <- dplyr::if_else(cg_labor_type == "No labor", 
+                                    "No labor",
+                                    "Labored") |>
+    factor(levels = c("Labored", "No labor"))
+  h_del_method <- factor(h_del_method, labels = c("Vaginal", "C-section"))
+  gdm <- factor(gdm, labels = c("No", "Yes"))
+  htn_pregnancy <- factor(htn_pregnancy, labels = c("No", "Yes"))
+  batch <- factor(batch) ## batch 4 is largest, but no
+  })
+```
+
+### Filter participants missing relevant covariates for each analysis
+
+```{r}
+covar_ratio <- covar_rnaseq |>
+  dplyr::select(pathways_id, protocol, site, batch, h_c_sex, h_m_delivery_age, 
+                race_collapsed, h_m_ethn, edu_collapsed, h_m_prepreg_bmi, smoking_composite,
+                parity_20, htn_pregnancy, gdm, labor_collapsed, h_del_method,
+                fetal_placental_ratio, placenta_weight, birthweight,
+                ## extras for table1
+                h_birth_gestage, h_m_race, h_m_enroll_educ) %>%
+  tidyr::drop_na(any_of(c("batch", "h_c_sex", "h_m_delivery_age", "smoking_composite",
+                "race_collapsed", "h_m_ethn", "edu_collapsed", "h_m_prepreg_bmi", 
+                "parity_20", "htn_pregnancy", "gdm", "labor_collapsed", 
+                "h_del_method", "fetal_placental_ratio"))) |>
+  dplyr::inner_join(PHTH, by = join_by(pathways_id)) |>
+  droplevels()
+
+dim(covar_ratio)
+```
+
+# Tables: Participant Characteristics
+
+First, generate TABLE 1
+
+```{r, results='asis'}
+tab1 <- tableby( ~ h_m_delivery_age +
+                   h_m_prepreg_bmi +
+                   fetal_placental_ratio +
+                   h_birth_gestage +
+                   site +
+                   batch +
+                   h_c_sex +
+                   labor_collapsed +
+                   h_del_method +
+                   smoking_composite +
+                   h_m_enroll_educ +
+                   h_m_race +
+                   h_m_ethn,
+                 data = covar_ratio, 
+                 numeric.test = "kwt", cat.test = "chisq",
+                 numeric.stats = c("median", "q1q3", "range", "sd", "Nmiss"),
+                 cat.stats = c("countpct", "Nmiss"))
+
+summary(tab1)
+```
+
+# RNA Sequencing Cleaning
+
+Start by removing the duplicated sample and the NovoSeq results from the samples that were run on both instruments, using length scaled TPM values.
+
+```{r}
+## remove the batch 4 duplicates
+LS_Counts <- lengthScaledTPM$counts[, -ind[[2]]]
+
+## check if duplicated names
+colnames(LS_Counts)[duplicated(colnames(LS_Counts))]
+dim(LS_Counts)
+
+## remove duplicate
+LS_Counts <- LS_Counts[, -which(duplicated(colnames(LS_Counts)))]
+
+## confirm duplicate removed
+colnames(LS_Counts)[duplicated(colnames(LS_Counts))]
+dim(LS_Counts)
+```
+
+We will follow these steps in this order. 
+
+1. Remove participants that don't have full covariate data
+2. Removed Enzembl IDs with the suffix "_PAR_Y"  
+3. Remove non-protein coding genes
+4. Performed Filtering on genes with mean cpm<0  
+5. Removed Duplicated Genes  
+6. TMM Normalization 
+
+```{r filtering}
+## Original Dimensions
+dim(LS_Counts)
+dim(annot)
+
+## Retain only complete cases (using covar_ratio) ####
+LS_Counts <- LS_Counts[, covar_ratio$pathways_id]
+
+## Dimensions after filtering for complete cases
+dim(LS_Counts)
+
+## Remove Ensembl IDs with the suffix "_PAR_Y" ####
+LS_Counts <- LS_Counts[!grepl("_PAR_Y", rownames(LS_Counts)), ]
+annot$ENSEMBL <- as.character(annot$ENSEMBL)
+annot <- annot[!grepl("_PAR_Y",annot$ENSEMBL), ]
+
+## Dimsenions after "_PAR_Y" removal
+dim(LS_Counts)
+dim(annot)
+
+## get rownames of count dataset to match annot$ENSEMBL by removing the "." and 
+## everything after it
+rownames(LS_Counts) <- gsub("\\..*", "", rownames(LS_Counts))
+
+## Retain only protein coding genes ####
+## filter the annot file
+annot <- subset(annot, BIOTYPE == "protein_coding") %>%
+  droplevels()
+
+## then filter based on what remains in annotation file
+LS_Counts <- LS_Counts[as.character(annot$ENSEMBL), ]
+
+## Dimensions retaining only protein coding genes
+dim(LS_Counts)
+dim(annot)
+
+## Remove genes with low expression ####
+## Keep genes with average log cpm>0
+logcpm <- cpm(LS_Counts, log = T)
+
+keep <- rowMeans(logcpm) > 0
+summary(keep)
+
+logcpm_filt <- logcpm[keep, ]
+LS_Counts_filt<-LS_Counts[keep, ]
+annot <- annot[keep, ]
+
+## Plot before and after filtering out low expressing genes
+
+plot(density(logcpm), main = "Before Removing low expressing genes")
+abline(v = 0, col = "red", lty = 2)
+
+plot(density(logcpm_filt), main = "After Removing low expressing genes")
+abline(v = 0, col = "red", lty = 2)
+
+## Dimensions after low expression filtering
+dim(LS_Counts_filt)
+dim(annot)
+dim(logcpm_filt)
+
+## Remove duplicated genes ####
+summary(duplicated(logcpm_filt))
+
+dupgenes <-as.character(annot[annot$ENSEMBL %in% rownames(logcpm_filt)[duplicated(logcpm_filt)], "SYMBOL"])
+dupgenes
+
+annot<-annot[-which(annot$SYMBOL%in%dupgenes),]
+logcpm_filt<-logcpm_filt[-which(duplicated(logcpm_filt)),]
+LS_Counts_filt<-LS_Counts_filt[-which(duplicated(LS_Counts_filt)),]
+
+## Dimensions after removing duplicates
+dim(LS_Counts_filt)
+dim(logcpm_filt)
+dim(annot)
+```
+
+Then conduct TMM normalization.
+
+```{r TMM Norm}
+#Make DGEList
+Y <- DGEList(counts = LS_Counts_filt, genes = annot$SYMBOL)
+
+Y_norm <- calcNormFactors(Y, method = "TMM") #This is the Default Method
+
+#Plot before and after normalization
+boxplot(cpm(Y ,log = T)[, 1:10], main = "Before Normalization")
+
+boxplot(cpm(Y_norm, log = T)[, 1:10], main = "After Normalization")
+```
+
+## BIRTHWEIGHT
+
+First, get spline knots:
+
+```{r}
+covar_ratio$placenta_weight |> summary()
+
+covar_ratio$placenta_weight |> scale() |> summary()
+
+## calculated the 25, 50, and 75 percentile for scale(placenta_weight)
+## in the N=163 participants included in this analysis
+knots = c(-0.60980, 0.00497, 0.53831)
+```
+
+```{r}
+## set seed to remain reproducible
+set.seed(2025)
+
+ensembl_genes <- annot[annot$SYMBOL %in% shared_genes, ]$ENSEMBL
+
+## function to make the table underlying the figure
+extract_mediation_summary <- function (x) { 
+
+  clp <- 100 * x$conf.level
+  isLinear.y <- ((class(x$model.y)[1] %in% c("lm", "rq")) || 
+                   (inherits(x$model.y, "glm") && x$model.y$family$family == 
+                      "gaussian" && x$model.y$family$link == "identity") || 
+                   (inherits(x$model.y, "survreg") && x$model.y$dist == 
+                      "gaussian"))
+
+  printone <- !x$INT && isLinear.y
+
+  if (printone) {
+
+    smat <- c(x$d1, x$d1.ci, x$d1.p)
+    smat <- rbind(smat, c(x$z0, x$z0.ci, x$z0.p))
+    smat <- rbind(smat, c(x$tau.coef, x$tau.ci, x$tau.p))
+    smat <- rbind(smat, c(x$n0, x$n0.ci, x$n0.p))
+
+    rownames(smat) <- c("ACME", "ADE", "Total Effect", "Prop. Mediated")
+
+  } else {
+    smat <- c(x$d0, x$d0.ci, x$d0.p)
+    smat <- rbind(smat, c(x$d1, x$d1.ci, x$d1.p))
+    smat <- rbind(smat, c(x$z0, x$z0.ci, x$z0.p))
+    smat <- rbind(smat, c(x$z1, x$z1.ci, x$z1.p))
+    smat <- rbind(smat, c(x$tau.coef, x$tau.ci, x$tau.p))
+    smat <- rbind(smat, c(x$n0, x$n0.ci, x$n0.p))
+    smat <- rbind(smat, c(x$n1, x$n1.ci, x$n1.p))
+    smat <- rbind(smat, c(x$d.avg, x$d.avg.ci, x$d.avg.p))
+    smat <- rbind(smat, c(x$z.avg, x$z.avg.ci, x$z.avg.p))
+    smat <- rbind(smat, c(x$n.avg, x$n.avg.ci, x$n.avg.p))
+
+    rownames(smat) <- c("ACME (control)", "ACME (treated)", 
+                        "ADE (control)", "ADE (treated)", "Total Effect", 
+                        "Prop. Mediated (control)", "Prop. Mediated (treated)", 
+                        "ACME (average)", "ADE (average)", "Prop. Mediated (average)")
+
+  }
+
+  colnames(smat) <- c("Estimate", paste(clp, "% CI Lower", sep = ""), 
+                      paste(clp, "% CI Upper", sep = ""), "p-value")
+  smat
+
+}
+
+## Make covariate matrix
+covariates <- covar_ratio |>
+  dplyr::mutate(pw = scale(placenta_weight))
+
+## covariates 
+cov_mat <- with(covariates, model.matrix(
+  ~ birthweight +
+    splines::ns(pw, knots=knots) +
+    h_c_sex + 
+    labor_collapsed +
+    h_del_method +
+    batch +
+    smoking_composite + 
+    h_m_delivery_age + 
+    h_m_prepreg_bmi + 
+    h_m_ethn + 
+    race_collapsed + 
+    edu_collapsed +
+    parity_20 + 
+    gdm +
+    htn_pregnancy +
+    SG
+                                           )) |>
+  as.data.frame() |>
+  dplyr::select(-1)
+
+## MEDIATORS
+M <- Y_norm[ensembl_genes, covariates$pathways_id] |>
+  cpm(log = TRUE) 
+
+assertthat::are_equal(colnames(M), covariates$pathways_id)
+
+mediation_res <- mclapply(1:length(ensembl_genes), function(i) {
+  
+  ## set up
+  ensembl_id <- ensembl_genes[i]
+  gene_name <- shared_genes[i]
+  
+  gene_logcpm <- M[ensembl_id, ] |> scale() |> as.vector()
+  phthalate <- covariates[, "mcinp"] |> unlist()
+  
+  ## models
+  fit.M <- lm(gene_logcpm ~ `splines::ns(pw, knots = knots)1` + 
+                `splines::ns(pw, knots = knots)2` + 
+                `splines::ns(pw, knots = knots)3` + 
+                `splines::ns(pw, knots = knots)4` + 
+                h_c_sexF + 
+                `labor_collapsedNo labor` + 
+                `h_del_methodC-section` + 
+                batch2 + 
+                batch3 + 
+                smoking_compositeYes + 
+                h_m_delivery_age +
+                h_m_prepreg_bmi + 
+                `h_m_ethnHispanic or Latino` + 
+                race_collapsedAsian + 
+                race_collapsedBlack_AA + 
+                race_collapsedOther + 
+                edu_collapsed1 + 
+                parity_20 + 
+                gdmYes + 
+                htn_pregnancyYes + 
+                SG + 
+                phthalate,
+              cov_mat)
+  
+  fit.Y <- lm(birthweight ~  
+                `splines::ns(pw, knots = knots)1` + 
+                `splines::ns(pw, knots = knots)2` + 
+                `splines::ns(pw, knots = knots)3` + 
+                `splines::ns(pw, knots = knots)4` + 
+                h_c_sexF + 
+                `labor_collapsedNo labor` + 
+                `h_del_methodC-section` + 
+                batch2 + 
+                batch3 + 
+                smoking_compositeYes + 
+                h_m_delivery_age +
+                h_m_prepreg_bmi + 
+                `h_m_ethnHispanic or Latino` + 
+                race_collapsedAsian + 
+                race_collapsedBlack_AA + 
+                race_collapsedOther + 
+                edu_collapsed1 + 
+                parity_20 + 
+                gdmYes + 
+                htn_pregnancyYes + 
+                SG + 
+                phthalate +
+                gene_logcpm,
+              data = cov_mat)
+  
+  mediation_mod <- mediate(fit.M, fit.Y, 
+                           treat = 'phthalate', 
+                           mediator = 'gene_logcpm',
+                           outcome = 'birthweight',
+                           boot = TRUE,
+                           sims = 10000)
+  
+  ## print gene name and summary
+  print(gene_name)
+  print(summary(mediation_mod))
+  
+  extract_mediation_summary(mediation_mod) |>
+    dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "term")) |>
+    dplyr::mutate(gene = gene_name,
+                  metabolite = "MCINP", 
+                  pair = paste("MCINP", gene_name, sep = " - "))
+  }) |>
+  dplyr::bind_rows()
+```
+
+## Visualize the mediation results
+
+Horizontal layout with total and direct effects.
+
+```{r fig.width=4.5, fig.height=3}
+all_mitm_plt <- mediation_res |>
+  ## data wrangling
+  dplyr::filter(term %in% c("Total Effect", "ACME", "ADE")) |>
+  ## Rename labels for plot
+  dplyr::mutate(effect_name = dplyr::case_match(
+    term, 
+    "Total Effect" ~ "TE",
+    "ACME" ~ "CME",
+    "ADE" ~ "DE"
+    )) |>
+  ## make variables for if the results are significant
+  dplyr::mutate(sig = dplyr::if_else(`p-value`<0.05, TRUE, FALSE)) |>
+  ## make significance stars
+  dplyr::mutate(stars = dplyr::if_else(sig == TRUE, "*", "")) |>
+  #### VIZUALIZE 
+  ggplot() +
+  ## add vertical line at ZERO: if lines cross, confidence interval includes 0
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  ## data: plot segment for 95% CI, point for point estimate, text for significance stars
+  geom_segment(aes(x = `95% CI Lower`, 
+                   xend = `95% CI Upper`, 
+                   y = effect_name, 
+                   yend = effect_name, 
+                   color = sig)) +
+  geom_point(aes(x = Estimate, 
+                 y = effect_name, 
+                 color = sig)) +
+  geom_text(aes(x = `95% CI Lower` - 15, ## plot stars off to the left
+                y = effect_name, 
+                label = stars, 
+                color = sig), 
+            size = 6) +
+  ## scale formatting
+  scale_color_manual(values = c("black", "tomato"), 
+                     name = "P < 0.05", 
+                     guide = "none") + 
+  scale_x_continuous(breaks = c(-100, 0, 100)) +
+  xlab("Effect Estimate, g") + 
+  ylab(NULL) +
+  theme_classic(base_size = 10) +
+  facet_wrap(vars(pair), ncol = 3) +
+  theme(
+      strip.text = element_text(face = "bold.italic"),
+      strip.background = element_rect(fill="transparent"),
+      panel.background = element_rect(fill='transparent'), #transparent panel bg
+      plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+      panel.grid.major = element_blank(), #remove major gridlines
+      panel.grid.minor = element_blank(), #remove minor gridlines
+      legend.background = element_rect(fill='transparent'), #transparent legend bg
+      legend.box.background = element_rect(fill='transparent') #transparent legend panel
+    ) 
+
+
+all_mitm_plt
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "mitm_formal_mediaiton_forest_plots.pdf"),
+       width = 4.5, height = 3, units = "in")
+```
+
+Since all these genes candidate mediators for the relationship between MCINP and BW~adj~, we can also visualize the indirect effects as a forest plot, so we can see which are significant or relatively stronger. 
+
+```{r fig.width=2, fig.height=2}
+mediation_res |>
+  ## data wrangling
+  dplyr::filter(term %in% c("ACME")) |>
+  ## Rename labels for plot
+  dplyr::mutate(effect_name = dplyr::case_match(
+    term, 
+    "Total Effect" ~ "TE",
+    "ACME" ~ "CME",
+    "ADE" ~ "DE"
+    )) |>
+  ## make variables for if the results are significant
+  dplyr::mutate(sig = dplyr::if_else(`p-value`<0.05, TRUE, FALSE)) |>
+  ## make significance stars
+  dplyr::mutate(stars = dplyr::if_else(sig == TRUE, "*", "")) |>
+  #### VIZUALIZE 
+  ggplot() +
+  ## add vertical line at ZERO: if lines cross, confidence interval includes 0
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  ## data: plot segment for 95% CI, point for point estimate, text for significance stars
+  geom_segment(aes(x = `95% CI Lower`, 
+                   xend = `95% CI Upper`, 
+                   y = gene, 
+                   yend = gene, 
+                   color = sig)) +
+  geom_point(aes(x = Estimate, 
+                 y = gene, 
+                 color = sig)) +
+  geom_text(aes(x = `95% CI Lower` - 10, ## plot stars off to the left
+                y = gene, 
+                label = stars, 
+                color = sig), 
+            size = 6) +
+  ## scale formatting
+  scale_color_manual(values = c("black", "tomato"), 
+                     name = "P < 0.05", 
+                     guide = "none") + 
+  scale_x_continuous(breaks = c(-100, 0, 100)) +
+  xlab("Indirect Effect, g") + 
+  ylab(NULL) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.title = element_markdown(),
+    axis.text.y = element_text(face = "bold.italic"),
+      strip.background = element_rect(fill="transparent"),
+      panel.background = element_rect(fill='transparent'), #transparent panel bg
+      plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+      panel.grid.major = element_blank(), #remove major gridlines
+      panel.grid.minor = element_blank(), #remove minor gridlines
+      legend.background = element_rect(fill='transparent'), #transparent legend bg
+      legend.box.background = element_rect(fill='transparent') #transparent legend panel
+    ) 
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "mitm_formal_mediaiton_CME_forest_plots.pdf"),
+       width = 2, height = 2, units = "in")
+```
+

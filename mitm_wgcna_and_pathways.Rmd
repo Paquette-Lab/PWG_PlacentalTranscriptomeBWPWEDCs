@@ -1,0 +1,186 @@
+---
+title: "GAPPS Phthalate WGCNA Figure"
+author: "Samantha Lapehn & Mariana Parenti"
+output: html_document
+---
+
+## Aims 
+
+a) Generate the WGCNA dotplot, showing the WGCNA modules associated with the phthalate metabolites, DEHP, and the mixture, as well as BW~adj~ and BW:PW ratio. 
+b) Generate the plot showing the enriched KEGG pathways for each WGCNA module identified in this analysis. 
+
+```{r load packages}
+library(tidyverse)
+library(pheatmap)
+library(here)
+library(ggtext)
+```
+
+## Load  Results
+
+```{r load results}
+sig_PHT <- read_csv(here::here("Mariana", "Draft3", "MITM_WGCNA_Figure", "SigWGCNA_071025.csv"))[, -1]
+
+BW_PE_modules <- read_csv(here::here("Mariana", "Draft3", "MITM_WGCNA_Figure", "WGCNA_sigResults_SPLINES_060525.csv"))
+
+mixtures_res <- read_csv(here::here("Mariana", "Draft3", "MITM_WGCNA_Figure", "GAPPS_Phthalate_WGCNA_QGComp_SigResults_071025.csv"))[, -1] |>
+  ## select and rename columns
+  dplyr::select(probeID, estimate = beta, std.error = se, statistic = tval, p.value = pval) |>
+  ## format probeID as module
+  dplyr::mutate(module = substring(probeID, 3)) |>
+  dplyr::select(-probeID) |>
+  dplyr::relocate(module) |>
+  ## add mixture column
+  dplyr::mutate(analysis = "Mixture") 
+
+mixtures_res
+```
+
+## Prepare Data
+
+```{r}
+sig_PHT$phthalate <- toupper(sig_PHT$phthalate)
+sig_PHT <- sig_PHT |>
+  dplyr::rename(analysis = phthalate) |>
+  dplyr::bind_rows(mixtures_res)
+
+BW_PE_modules <- BW_PE_modules[, c(2, 1, 3:6)]
+
+All_modules <- rbind(sig_PHT, BW_PE_modules)
+
+All_modules <- All_modules |>
+  mutate(analysis = ifelse(analysis == "Birthweight", "BW(adj)", analysis))
+```
+
+## Make Summary Dot Plot
+
+```{r DotPlot, fig.width=8, fig.height=6}
+levels(as.factor(All_modules$module)) |> dput()
+
+# Module <- c(black="black", blue="blue", brown="chocolate4", 
+#             darkgreen="darkgreen", darkolivegreen="darkolivegreen", 
+#             darkorange="darkorange3", darkturquoise="darkturquoise", 
+#             green="green", greenyellow="olivedrab2", grey60="grey60", 
+#             lightcyan="lightcyan3", lightgreen="seagreen2", magenta="magenta", 
+#             orange="orange", purple="purple", red="red", royalblue= "royalblue",
+#             salmon="salmon", sienna3="sienna3", skyblue="skyblue3", tan="tan",
+#             turquoise="turquoise", violet="mediumpurple1", white="ivory3",
+#             yellow="gold2",yellowgreen="yellowgreen")
+
+Module <- c(black = "black", blue = "blue", brown = "chocolate4", cyan = "cyan3",
+            darkgreen = "darkgreen", darkolivegreen = "darkolivegreen", 
+            darkorange = "darkorange", darkturquoise = "darkturquoise",
+            green = "green3", greenyellow = "olivedrab3", grey60 = "grey60", 
+            lightcyan = "lightcyan3", lightgreen = "seagreen2",
+            lightyellow = "lightgoldenrod2", magenta = "magenta", 
+            orange = "orange", pink = "palevioletred1", red = "red", 
+            royalblue = "royalblue", salmon = "salmon", sienna3 = "sienna3",
+            skyblue = "skyblue", skyblue3 = "skyblue3", steelblue = "steelblue3",
+            tan = "tan", turquoise = "turquoise", violet = "mediumpurple1", 
+            white = "ivory3", yellow = "gold2", yellowgreen = "yellowgreen")
+
+analysis_order <- c("BW:PW", "BW(adj)", "DEHP", "MBP", "MBZP", "MCHPP", "MCINP", 
+                    "MCIOP", "MCMHP", "MCPP", "MECPP", "MEHHP", "MEHP", "MEOHP", 
+                    "MEP", "MHPP", "MIBP", "MMP", "Mixture")
+
+ggplot(All_modules |> 
+         dplyr::mutate(analysis = factor(analysis, levels = analysis_order)), 
+       aes(x=analysis, y=module, fill = estimate)) + 
+  labs(color = "Effect Estimate") +
+  geom_point(
+    aes(size = abs(estimate)),
+    shape = 21, color = "black", stroke = 0.2) +
+  labs(size="Abs(Effect Estimate)") +
+  theme_bw() + 
+labs(y = "Module", x="Analysis")+
+    scale_fill_gradient2(midpoint=0, 
+                        low="#0092B3", mid="White", high="#F09062", 
+                        name = "Effect Estimate") +
+  guides(size = guide_legend(override.aes = list(fill = "black"))) +
+  theme(
+    axis.text.x = element_markdown(angle=45, size=12, hjust=1),
+    axis.text.y=element_text(size=12, color = Module, face = "bold"), 
+    legend.text=element_text(size=12), 
+    axis.title= element_text(size=14)) 
+
+ggsave(filename = "MITM_WGCNA_dotplot_20250710.pdf", path = here::here("Mariana", "Draft3", "output"), width = 8, height = 8, units = "in")
+```
+
+## Pathway Enrichment in the WGCNA modules
+
+```{r fig.height=9, fig.width=5}
+pathdata <- read_csv(here::here("Resubmission_July2024/output/wgcna/allPathwaysEnrichmentResults.csv")) |>
+  dplyr::filter(FDR<0.2) |>
+  dplyr::filter(module %in% All_modules$module) |>
+  dplyr::mutate(magnitude = -log(P.DE),
+                pathway_name = stringr::str_replace_all(Pathway, "_", " "),
+                FDR_05_level = dplyr::if_else(FDR<0.05, 1, 0) |> factor()) |>
+  dplyr::mutate(pathway_name = dplyr::if_else(
+    pathway_name == "Hippo signaling pathway multiple species", 
+    "Hippo signaling pathway - multiple species",
+    pathway_name)) |>
+  dplyr::mutate(pathway_name = dplyr::if_else(
+    pathway_name == "Autophagy animal", 
+    "Autophagy - animal",
+    pathway_name)) 
+
+levels(factor(pathdata$module)) |> dput()
+
+library(jsonlite)
+
+kegg_hierarchy <- jsonlite::read_json("https://rest.kegg.jp/get/br:br08901/json", 
+                                      simplifyVector = FALSE) [[2]]
+
+kegg_pathway_groups <- purrr::map_dfr(kegg_hierarchy,  ~ as_tibble(.x)) |>
+  tidyr::unnest_wider(col = children, names_sep = "_") |>
+  tidyr::unnest_wider(col = children_children, names_sep = "_") |>
+  tidyr::pivot_longer(cols = !name:children_name,
+                      names_to = "child_name",
+                      values_to = "list") |>
+  tidyr::unnest_wider(col = list, names_sep = "_") |>
+  dplyr::select(supergroup = name, 
+                subgroup = children_name, 
+                id_pathway = list_name) |>
+  dplyr::filter(is.na(id_pathway) == FALSE) |>
+  dplyr::mutate(kegg_pathway_id = stringr::str_split_fixed(id_pathway, " ", 2)[, 1],
+                pathway_name = stringr::str_split_fixed(id_pathway, " ", 2)[, 2]) |>
+  dplyr::mutate(pathway_name= substring(pathway_name, 2))
+
+pathway_order <- kegg_pathway_groups |>
+  dplyr::filter(pathway_name %in% pathdata$pathway_name) |>
+  dplyr::arrange(supergroup, subgroup, pathway_name) |>
+  dplyr::pull(pathway_name)
+
+pathway_plot_ordered <- pathdata |>
+  dplyr::mutate(pathway_name = factor(pathway_name, levels = pathway_order)) |>
+  ggplot() +
+  aes(x = factor(module), 
+      y = pathway_name) +
+  geom_point(aes(size = magnitude, 
+                 fill = module, 
+                 shape = FDR_05_level),
+             stroke = 0.2) +
+  # geom_point(data = pathdata |> dplyr::filter(FDR <0.05),
+  #            size = 1, stroke = 0.5,
+  #            shape = 8, alpha = 0.5) +
+  ylab("") +
+  xlab("") +
+  scale_fill_manual(values = c("blue", "brown", "cyan", "darkgreen", 
+                               "darkorange", "darkturquoise", "green", 
+                               "greenyellow", "lightcyan", "lightyellow", 
+                               "magenta", "orange", "pink", "red", "royalblue",
+                               "skyblue", "skyblue3", "steelblue", "tan", 
+                               "turquoise", "yellow", "yellowgreen")) +
+  scale_shape_manual(values = c(22, 21), name = "FDR", labels = c("<0.20", "<0.05")) +
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    panel.background = element_blank(), 
+    plot.background = element_blank())
+
+pathway_plot_ordered
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "wgcnaModulePathways_MITA_transparent.pdf"),
+       width = 5.5, height = 11, units = "in")
+```

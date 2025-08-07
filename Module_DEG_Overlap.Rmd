@@ -1,0 +1,91 @@
+---
+title: "GAPPS_Phthalate_BWPW_ModuleDEGOverlap"
+author: "Samantha Lapehn"
+date: "2025-07-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GAPPS Phthalates and BW, BW:PW- DEG and Module Overlap
+In this code, we take the genes associated with Phthalates, Birthweight(adj), or BW:PW (DEGs=FDR<0.05) and overlap them with the genes inside modules that are either 1) Meet in the middle modules or 2) Modules that are significant in the high-dimensional mediation analysis. The resulting overlap is used to create a supplemental table. 
+
+### Load Packages
+```{r load packages}
+library(tidyverse)
+library(reshape2)
+library(openxlsx)
+```
+
+### Load Data
+Loading: 
+1) Phthalate DEGs
+2) BW(adj)-spline and BW:PW DEGs
+3) WGCNA Modules and Genes
+```{r load data}
+PhthalateDEGs <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FullModel_DEGs_GeoMean_LN_071025.csv")
+PE_DEGs <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/BWPW_ResultsfromMariana/sigResults_DEGS_SPLINES_ratio_birthweight_sex.csv")
+
+WGCNAMods <-load("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_ensembl.RData")
+
+ModuleMembership<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/output/wgcna/allGenesModuleMembership.csv")
+#View module sizes
+summary(factor(ModuleMembership$Module))
+
+```
+### Overlap with Modules 
+Including modules that were significant mediators fo rthe HIMA analysis: Blue, White, Greenyellow, and Orange for BWadj and Sienna3 for BW:PW. Also including modules that were MITM modules: Salmon, Lightcyan, Orange, Blue, DArkOrange, Sienna3, White, Skyblue
+```{r overlap}
+PE_DEG_Modules <- inner_join(PE_DEGs, ModuleMembership, by=c("genes"="SYMBOL")) %>%
+  dplyr::filter(analysis=="Overall") %>%
+  dplyr::select(-analysis)
+#This file had sex-stratified results too so limiting to only the overall analysis
+
+Ratio_DEG_modules <- PE_DEG_Modules %>%
+  dplyr::filter(outcome=="BW:PW")
+
+BW_DEG_modules <- PE_DEG_Modules %>%
+  dplyr::filter(outcome=="Birthweight")
+
+Sig_Modules_Ratio_DEGs <- Ratio_DEG_modules %>%
+  dplyr::filter(Module %in% c("blue", "sienna3",  "white", "greenyellow", "orange", "salmon", "lightcyan", "darkorange", "skyblue"))
+summary(factor(Sig_Modules_Ratio_DEGs$Module))
+
+Sig_Modules_BW_DEGs <- BW_DEG_modules %>%
+  dplyr::filter(Module %in% c("blue", "sienna3",  "white", "greenyellow", "orange", "salmon", "lightcyan", "darkorange", "skyblue"))
+summary(factor(Sig_Modules_BW_DEGs$Module))
+
+Phthalate_DEG_Modules <- inner_join(PhthalateDEGs, ModuleMembership, by=c("genes"="SYMBOL"))
+summary(factor(Phthalate_DEG_Modules$Module))
+Sig_Modules_PHT_DEGs <- Phthalate_DEG_Modules %>%
+  dplyr::filter(Module %in% c("blue", "sienna3",  "white", "greenyellow", "orange", "salmon", "lightcyan", "darkorange", "skyblue"))
+summary(factor(Sig_Modules_PHT_DEGs$Module))
+```
+### DEG/Module home table prep
+```{r prepare data}
+#Get Columns cleaned up
+Sig_Modules_Ratio_DEGs$Analysis <-("BW:PW")
+Sig_Modules_BW_DEGs$Analysis <-c("Birthweight(adj)")
+Sig_Modules_PHT_DEGs <- rename(Sig_Modules_PHT_DEGs, Analysis = Phthalate)
+Sig_Modules_BW_DEGs <- rename(Sig_Modules_BW_DEGs, ensembl_id = ensembl_gene_id)
+Sig_Modules_Ratio_DEGs <- rename(Sig_Modules_Ratio_DEGs, ensembl_id = ensembl_gene_id)
+Sig_Modules_BW_DEGs <- Sig_Modules_BW_DEGs %>%
+  dplyr::select(-outcome)
+Sig_Modules_Ratio_DEGs <- Sig_Modules_Ratio_DEGs %>%
+  dplyr::select(-outcome)
+Sig_Modules_PHT_DEGs <- Sig_Modules_PHT_DEGs %>%
+  dplyr::select(-X)
+Sig_Modules_PHT_DEGs <- Sig_Modules_PHT_DEGs %>%
+  relocate(Analysis, .after = last_col())
+sum(colnames(Sig_Modules_BW_DEGs)==colnames(Sig_Modules_PHT_DEGs))
+sum(colnames(Sig_Modules_Ratio_DEGs)==colnames(Sig_Modules_PHT_DEGs))
+
+#Row bind the dataframes of overlapping DEGs in significant mediation modules
+Sig_Module_DEGs_All <- rbind(Sig_Modules_BW_DEGs,Sig_Modules_Ratio_DEGs, Sig_Modules_PHT_DEGs)
+
+#Save this table
+#write.csv(Sig_Module_DEGs_All, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/FiguresandTables/ModuleofInterest_DEGMembership_withGAPPSData_080425.csv")
+
+```

@@ -1,0 +1,161 @@
+---
+title: "PATHWAYS GAPPS Cohort-Wide WGCNA: Conditional Quantile Normalization"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+This is updated code to generate the normalized data, based on email correspondence with James MacDonald on 20231017. 
+We will now use the GC composition and gene lengths as calculated using the exons, rather than the full gene. 
+We are also using the counts (not length-scaled data sets).
+Note that we are not using the covariate data at all here because we are just using all available transcriptomics data. 
+
+## Load libraries
+
+```{r}
+library(tidyverse)  ## tidy data framework, ggplot2, pipes
+library(here)       ## sets path nicely for markdown
+library(edgeR)      ## differential expression analysis; limma/voom dependencies
+library(cqn)        ## for cqn function
+```
+
+## Load data
+
+```{r}
+## used code Jim sent for CQN last year, updated script produces this output
+forcqn <- readRDS(here::here("Resubmission_July2024/intermediateData/forcqn.Rds"))
+head(forcqn)
+
+load(here::here("Resubmission_July2024/NEW_RawData/gapps_20240325.Rdata"))
+counts$counts[1:6, 1:6]
+```
+
+## Workflow
+
+a. Remove duplicated samples
+b. Filter the data 
+  - to remove genes with > logCPM = 0 counts across all samples, genes with duplicates, and non-protein coding genes
+c. Perform cqn by inputting the count data, as wel as the provided gene length and gc content
+d. Pull the cqn normalized RPKM: `RPKM.cqn <- cqn$y + cqn$offset`
+e. Run WGCNA with the filtered cqn normalized RPKM data
+
+
+#### RNA Sequencing Cleaning
+
+Start by removing the duplicated sample and the NovoSeq results from the samples that were run on both instruments, using counts dataset.
+
+```{r}
+## remove the batch 4 duplicates
+Counts <- counts$counts[, -ind[[2]]]
+
+## check if duplicated names
+colnames(Counts)[duplicated(colnames(Counts))]
+dim(Counts)
+
+## remove duplicate
+Counts <- Counts[, -which(duplicated(colnames(Counts)))]
+
+## confirm duplicate removed
+colnames(Counts)[duplicated(colnames(Counts))]
+dim(Counts)
+```
+
+#### Filter data
+
+```{r}
+print("Original")
+print(dim(annot)[1])
+print(dim(Counts)[1])
+
+# get rownames of count dataset to match annot$ENSEMBL by removing the "." and 
+# everything after it
+rownames(Counts) <- gsub("\\..*", "", rownames(Counts))
+
+## subset only protein coding
+annot <- subset(annot, BIOTYPE == "protein_coding")
+Counts <- Counts[as.character(annot$ENSEMBL), ]
+
+print(dim(Counts)[1])
+
+#Get CPM & Log Transform
+cpm <- cpm(Counts, log = TRUE) #### NOT Length Scaled
+
+#filter based on low expression
+keep <- rowMeans(cpm) > 0
+summary(keep)
+
+cpm_filt<-cpm[keep, ]
+counts_filt<-Counts[keep, ] ## counts not LSCounts
+annot<-annot[keep, ]
+
+print("Filtering")
+print(dim(cpm_filt)[1])
+print(dim(counts_filt)[1])
+
+plot(density(cpm),main="Before Filtering")
+abline(v =0, col = "red", lty = 2)
+plot(density(cpm_filt),main="After Filtering")
+abline(v =0, col = "red", lty = 2)
+
+#remove duplicate genes
+summary(duplicated(cpm_filt))
+summary(duplicated(annot$SYMBOL))
+
+dupgenes <- as.character(annot[annot$ENSEMBL %in% rownames(cpm_filt)[duplicated(cpm_filt) | duplicated(annot$SYMBOL) == TRUE], "SYMBOL"])
+dupgenes
+
+annot <- annot %>% dplyr::filter(!SYMBOL %in% dupgenes)
+cpm_filt <- cpm_filt[rownames(cpm_filt) %in% annot$ENSEMBL, ]
+counts_filt <- counts_filt[rownames(counts_filt) %in% annot$ENSEMBL, ]
+
+table(annot$BIOTYPE)
+
+print("Remove Duplicate Genes")
+print(dim(annot)[1])
+print(dim(cpm_filt)[1])
+print(dim(counts_filt)[1])
+
+Y <- DGEList(counts=counts_filt, genes = annot$SYMBOL)
+
+boxplot(Y$counts[,1:10])
+boxplot(cpm[,1:10])
+boxplot(cpm(Y,log=T)[,1:10])
+```
+
+#### CQN
+
+Check that all of the rownames are in order
+
+```{r}
+## order genes by IDS
+counts_filt <- counts_filt[sort(rownames(counts_filt)), ]
+
+## check that GC content is in the same order as counts_flit
+forcqn <- forcqn[sort(rownames(forcqn)), ]
+forcqn <- forcqn[rownames(forcqn) %in% rownames(counts_filt), ]
+assertthat::are_equal(rownames(forcqn), rownames(counts_filt))
+
+## make size factors and check that they are in order
+sf <- colSums(counts_filt)
+head(sf)
+assertthat::are_equal(names(sf), colnames(counts_filt))
+```
+
+Now, to do the actual normalization, now that we have a vector of lengths, size factors, and GC content. 
+
+```{r}
+cqn_dat <- cqn(counts = counts_filt, x = forcqn[, "gccontent"] , lengths = forcqn[, "length"], sizeFactors = sf, 
+               verbose = FALSE)
+```
+
+Pull the normalized RPKM. 
+
+```{r}
+RPKM_cqn <- cqn_dat$y + cqn_dat$offset
+```
+
+#### Save Data
+
+```{r}
+save(annot, cqn_dat, RPKM_cqn, file = (here::here("Resubmission_July2024/intermediateData/cqn_data.Rds")))
+```

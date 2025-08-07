@@ -1,0 +1,250 @@
+---
+title: "GAPPS: Placental Gene Expression and Phthalate Exposures"
+author: "Samantha Lapehn and Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Phthalates RNAseq Analysis (N=222)
+This code performs the RNAseq analysis for associations between phthalates and the placental transcriptome. We use FDR<0.05 for significance. 
+
+
+### Load Libraries
+
+```{r load packages}
+library(tidyverse)
+library(here)
+library(assertthat)
+library(edgeR)
+library(RColorBrewer)
+library(kableExtra) 
+library(RUVSeq) 
+library(ggrepel)
+library(biomaRt)
+library(org.Hs.eg.db)
+```
+
+#### Load Data
+
+```{r load data}
+## Filterd and Normalized RNAseq
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FilteredNormalizedRNAseq_N222_041525.RData")
+
+## Filtered and Natural Log Transformed Phthalate Data
+PHT_noDEHP <-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Phthalate_CleanedLogData_GeoMean_LN_N222_041525.csv")
+
+
+DEHP<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_N222_050825.csv")
+
+PHT <- inner_join(PHT_noDEHP, DEHP, by=c("X"="pathways_id"))
+
+rownames(PHT) <- PHT$X
+PHT <- PHT %>%
+  dplyr::select(-X, -X.y)
+
+## Filtered covariates
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FinalCovariates_N222_041525.Rdata")
+covars <- covar_final
+covars <- data.frame(covars)
+rownames(covars) <- covars$pathways_id
+
+sum(rownames(PHT) == rownames(covars))
+
+#Combine Covar + Phthalates
+covar_PHT <- merge(covars, PHT, by='row.names')
+
+#Check order
+rownames(covar_PHT) <- covar_PHT$Row.names
+covar_PHT <- covar_PHT %>%
+  dplyr::select(-Row.names)
+sum(rownames(covar_PHT) == colnames(Y_norm$counts))
+
+#Check variable types
+summary(covar_PHT)
+
+covar_PHT$batch <- factor(covar_PHT$batch, levels=c("1", "2", "3"))
+
+summary(covar_PHT)
+```
+
+### Differential Gene Expression Analysis
+
+```{r DEGanalysis}
+all_PHT_results <- lapply(colnames(PHT)[1:16], function(phthalate) {
+    ## first, build mod using get function
+  mod <- with(covar_PHT, 
+              model.matrix(~ get(phthalate) + 
+                             h_c_sex + 
+                               labor_collapsed +
+                               h_del_method +
+                               h_m_delivery_age + 
+                              h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               parity_20 + 
+                              SG + 
+                             smoking_composite + 
+                             batch
+                             ))
+  
+  ## now, limma-voom
+  v <- voom(Y_norm, mod, plot = TRUE)  
+  designMatrix <- v$design
+  fit <- eBayes(lmFit(v, designMatrix))
+
+  ## get results (remember, we want coef 2) and turn into a tibble
+  res_PHT <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH") %>%
+    as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_id")) %>%
+    dplyr::mutate(Phthalate = phthalate) %>%
+    dplyr::relocate(Phthalate)
+  
+  }) %>%
+  dplyr::bind_rows() 
+
+lapply(colnames(PHT)[1:16], function(phthalate) {
+  temp <- all_PHT_results %>%
+    dplyr::filter(Phthalate == phthalate)
+  
+  tibble(Phthalate = phthalate, 
+         `FDR<0.05` = sum(temp$adj.P.Val<0.05),
+         `FDR<0.10` = sum(temp$adj.P.Val<0.1),
+         `FDR<0.20` = sum(temp$adj.P.Val<0.2),
+         `P<0.005` =  sum(temp$P.Value<0.005))
+  }) %>%
+  dplyr::bind_rows() %>%
+  kable() %>%
+  kableExtra::kable_styling()
+```
+
+
+### Plotting p-values
+```{r fig.width=10, fig.height=10}
+all_PHT_results$Phthalate <- toupper(all_PHT_results$Phthalate)
+ggplot(all_PHT_results, aes(x = P.Value)) +
+  geom_histogram(bins = 20, fill = "grey") +
+  geom_hline(yintercept = 13154/20, linetype = "dashed", color = "tomato") +
+  theme_classic() +
+  facet_wrap(. ~ Phthalate, scales = "fixed")
+```
+
+### Make Phthalate DEG Table
+```{r phthalate dEG table}
+#Filter for signficant data
+sig_PHT_results <- all_PHT_results %>%
+  dplyr::filter(adj.P.Val<0.05)
+unique(sig_PHT_results$Phthalate)
+#Export to reformat as DEG table
+#write.csv(sig_PHT_results,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Phthalate_DEGs_GeoMean_071025.csv")
+
+```
+
+### Make Phthalate Volcano Plots of Sig Metabolites only
+Make a volcano plot for each phthalate metabolite with DEGs
+```{r phthalate volcano plot}
+#Step 1: Which phthalate metabolites have DEGs
+sig_phthalates <- as.factor(sig_PHT_results$Phthalate)
+summary(sig_phthalates)
+
+#Step 2: Split Data for VPlots
+mcinp_allresults <- all_PHT_results %>%
+  dplyr::filter(Phthalate=="MCINP")
+mmp_allresults <- all_PHT_results %>%
+  dplyr::filter(Phthalate=="MMP")
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(RColorBrewer)
+library(tibble)
+
+MakeVPlot <- function(Results, Title){
+  # Filter for significant genes (FDR < 0.05)
+  sig <- Results[Results$adj.P.Val < 0.05, ]
+  sig <- sig[order(sig$adj.P.Val), ]
+  
+  # Separate up and down regulated genes
+  sig_up <- sig[sig$logFC > 0, ]
+  sig_down <- sig[sig$logFC < 0, ]
+  
+  # Colors from RdBu palette
+  ColorPalette <- brewer.pal(11, "RdBu")[c(2:4, 8:10)]
+  color_up <- ColorPalette[3]
+  color_down <- ColorPalette[4]
+  
+  # Top 5 significant genes
+  top5 <- head(sig, 10)
+  
+  # Create the plot
+  library(ggplot2)
+  library(ggrepel)
+  
+  p <- ggplot(Results, aes(x = logFC, y = -log10(P.Value))) +
+    geom_point(color = "grey60", size = 0.8) +
+    geom_point(data = sig_up, color = color_up, size = 1.2) +
+    geom_point(data = sig_down, color = color_down, size = 1.2) +
+    geom_text_repel(data = top5, aes(label = genes),
+                    size = 3,
+                    max.overlaps = Inf,
+                    box.padding = 0.4,
+                    point.padding = 0.2,
+                    segment.size = 0.3,
+                    segment.color = "black") +
+    labs(title = Title,
+         x = "Effect Estimate",
+         y = "Negative Log(p-value)") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 7)) +
+    theme_bw() + 
+    theme(plot.title = element_text(hjust = 0.5, face="bold"))
+  
+  return(p)
+}
+
+library(gridExtra)
+
+p1 <- MakeVPlot(mcinp_allresults, "MCINP")
+p2 <- MakeVPlot(mmp_allresults, "MMP")
+
+grid.arrange(p1, p2, ncol = 2)
+
+
+```
+
+### Evaluate overlap 
+```{r evaluate overlap}
+#Split Data into sig subsets
+mcinp_sigresults <- all_PHT_results %>%
+  dplyr::filter(Phthalate=="MCINP") %>%
+  dplyr::filter(adj.P.Val<0.05)
+mmp_sigresults <- all_PHT_results %>%
+  dplyr::filter(Phthalate=="MMP") %>%
+  dplyr::filter(adj.P.Val<0.05)
+#Make list for upset Plot
+sig_list <- list("MCINP"=mcinp_sigresults$genes, "MMP"=mmp_sigresults$genes)
+
+library(UpSetR)
+upset(fromList(sig_list), nsets=8, order.by="freq")
+index <- upset(fromList(sig_list), nsets=8, order.by="freq")
+
+# Creating Indexing Matrix
+#First you'll pull the index lists from the upset_plot data then you'll pull the names for the index list. Lastly you'll combine these two into a dataframe
+upset_matrix <- index$New_data #this pulls the indexing matrix
+upset_names <- unlist(sig_list, use.names=FALSE) #this pulls the gene names
+upset_names <- upset_names[!duplicated(upset_names)] # this removes duplicates so that they are in the correct order for the matrix
+upset_DF<- data.frame(upset_matrix, row.names=upset_names) #Combines the names and the index into a datamatrix
+#Make sum measure
+upset_DF$Sum <- rowSums(upset_DF)
+count(upset_DF$Sum>1)
+
+```
+
+### Write results
+
+```{r save results}
+#write.csv(upset_DF, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEGOverlap_N222_GeoMean_LN_071025.csv")
+#write.csv(sig_PHT_results, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FullModel_DEGs_GeoMean_LN_071025.csv")
+#write.csv(all_PHT_results,  "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FullModel_AllGeneResults_GeoMean_LN_071025.csv")
+
+```

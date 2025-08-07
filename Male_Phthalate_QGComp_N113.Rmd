@@ -1,0 +1,104 @@
+---
+title: "Male_QGComp for GAPPS Phthalates"
+author: "Samantha Lapehn"
+date: "07-11-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Male QGComp for GAPPS RNAseq and PHthalate Data
+Using this code to run quantile g-based computation for phthalates mixtures in GAPPS and the placental transcriptome. We used p<0.005 to define significance for the mixture analysis.
+
+The EWAS_QGComp code is from Dennis Khodasevich and available here. https://github.com/D-Khodasevich/EWAS_QGComp
+
+
+### Load Packages and Functions
+```{r packages}
+library(tidyverse)
+library(qgcomp)
+library(data.table)
+library(edgeR)
+
+source("/Volumes/paquette_a/slapehn/OPE_and_PlacentalTranscriptome/EWAS_QGComp Code from Dennis/EWAS_QGComp_Functions_Update3.R")
+#Updated source code received 8/21/23 and should fix the output when using the "full" option for the main and bootstrap functions
+```
+
+### Load Data
+Need covariates and exposure data
+```{r load data}
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Male/Male_FilteredNormalizedRNAseq_N113_041625.RData")
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Male/Male_FinalCovariates_N113_041625.Rdata")
+PHT<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Male/Male_Phthalate_CleanedLogData_GeoMean_LN_N113_041625.csv")
+covar_final$batch <- factor(covar_final$batch, levels=c("1", "2", "3"))
+summary(covar_final$batch)
+```
+
+### Prepare Exposure Data
+
+```{r prep exposure data}
+Xnm<-colnames(PHT)
+Xnm <- Xnm[2:16]
+```
+
+### Prepare Covariate Data
+Need to remove any covariates that we aren't using
+Note- not including smoking since tehre are not enough for a proper contrast
+```{r covar prep}
+
+Covariates_Selected <- covar_final %>%
+  dplyr::select( pathways_id, labor_collapsed, h_del_method, h_m_delivery_age, h_m_prepreg_bmi, h_m_ethn, race_collapsed, edu_collapsed, parity_20, SG, batch)
+
+covars <- c("labor_collapsed", "h_del_method", "h_m_delivery_age", "h_m_prepreg_bmi", "h_m_ethn", "race_collapsed", "edu_collapsed", "parity_20", "SG", "batch")
+
+```
+
+### Combine Covariate and Exposure Data into Single dataframe for OPEs
+```{r combine exposure and covar for OPE}
+Pheno <- data.frame(inner_join(Covariates_Selected, PHT, by=c("pathways_id"="X")))
+
+rownames(Pheno) <- Pheno$pathways_id
+Pheno <- Pheno %>%
+  dplyr::select(-pathways_id)
+
+#Check data types
+summary(Pheno)
+
+```
+
+### Prep Expression Data
+```{r expr prep}
+meth <- cpm(Y_norm$counts, log=T)
+```
+
+### Check that order of Expression and Pheno Data are the same
+```{r check order}
+check <- colnames(meth) == rownames(Pheno)
+sum(check)
+```
+
+## Bootstrap EWAS QGComp
+will perform bootstrapping 
+
+### Run Bootstrap EWAS QGComp
+Two new parametes need to be set for bootstrap version: 
+
+Bval is the number of bootstraps to perform
+seedval is to set a seed for reproducibility
+
+```{r bootstrap OPE}
+ewas_qgcomp_fit.boot <- ewas_qgcomp.boot(pheno = Pheno, meth = meth, 
+                           mix_comp = Xnm, covars = covars, mval_conversion=FALSE, 
+            qval=4, output_type="full", Bval=1000, seedval=1234)
+
+
+
+view(ewas_qgcomp_fit.boot$results)
+ewas_qgcomp_fit.boot$results$FDR<-p.adjust(ewas_qgcomp_fit.boot$results$pval, method="BH")
+#save(ewas_qgcomp_fit.boot, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Male/Male_GAPPS_Phthalate_QGCompResults_GeoMean_071125.Rdata")
+```
+

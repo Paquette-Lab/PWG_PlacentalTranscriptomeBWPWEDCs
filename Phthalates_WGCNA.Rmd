@@ -1,0 +1,161 @@
+---
+title: "GAPPS WGCNA: Modules Associated with Phthalate Exposures"
+author: "Mariana Parenti & Samantha Lapehn"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Phthalates WGCNA
+This code evaluates the association between GAPPS WGCNA modules and phthalates. We used a p-value<0.05 to determine significance for WGCNA.
+
+### Load Libraries
+
+```{r load packages}
+library(tidyverse)
+library(here)
+library(assertthat)
+library(kableExtra)
+library(biomaRt)         ## interfaces with BioMart
+library(AnnotationHub)   ## link to central genomic and related resources
+library(cowplot)
+library(viridis)
+```
+
+### Load Data
+
+```{r load data}
+## WGCNA
+load(here::here("Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_ensembl.RData"))
+
+## Filtered and Natural Log Transformed Phthalate Data
+PHT <-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Phthalate_CleanedLogData_GeoMean_LN_N222_041525.csv")
+rownames(PHT) <- PHT$X
+DEHP<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/DEHP_Clean_N222_050825.csv")
+colnames(DEHP) <- c("X", "pathways_id", "DEHP")
+rownames(DEHP) <- DEHP$pathways_id
+
+PHT <- inner_join(PHT, DEHP, by=c("X"="pathways_id"))
+rownames(PHT) <- PHT$X
+PHT <- PHT %>%
+  dplyr::select(-X, -X.y)
+
+## Filtered covariates
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FinalCovariates_N222_041525.Rdata")
+covars <- covar_final
+covars <- data.frame(covars)
+rownames(covars) <- covars$pathways_id
+
+sum(rownames(PHT) == rownames(covars))
+
+#Combine Covar + Phthalates
+covar_PHT <- merge(covars, PHT, by='row.names')
+summary(covar_PHT)
+
+covar_PHT$batch <- factor(covar_PHT$batch, levels=c("1", "2", "3"))
+summary(covar_PHT)
+
+```
+
+## WGCNA analysis
+
+
+### Phthalates
+#### Prepare and Check Data
+```{r, include=FALSE}
+
+## make a variable for just the module names
+moduleColorsPHT <- moduleColors
+moduleNamesPHT <- as.character(unique(moduleColorsPHT))
+
+## make sure to name the module colors with gene symbols
+names(moduleColorsPHT) <- rownames(geneModuleMembership)
+geneModuleMembershipPHT <- geneModuleMembership
+
+## now, subset the WGCNA objects to only include the subjects in COVAR
+## and sort by order in covar dataset
+cqn_expr_transposePHT <- cqn_expr_transpose[covar_PHT$pathways_id, ]
+MEsPHT <- MEs[covar_PHT$pathways_id, ]
+
+sum(rownames(MEsPHT)==covar_PHT$Row.names)
+## now that everything is renamed
+## remove the "originals"
+rm(geneModuleMembership, MEs, cqn_expr_transpose, moduleColors)
+
+
+## check dimensions
+dim(covar_PHT)
+dim(MEsPHT)
+dim(geneModuleMembershipPHT)
+dim(cqn_expr_transposePHT)
+length(moduleColorsPHT)
+length(annot$SYMBOL)
+
+## change length of annot
+annotPHT <- annot[annot$ENSEMBL %in% colnames(cqn_expr_transposePHT), ]
+
+## check orders
+## genes
+assertthat::are_equal(names(moduleColorsPHT), rownames(geneModuleMembershipPHT))
+assertthat::are_equal(colnames(cqn_expr_transposePHT), rownames(geneModuleMembershipPHT))
+assertthat::are_equal(as.character(annotPHT$ENSEMBL), rownames(geneModuleMembershipPHT))
+
+## samples
+assertthat::are_equal(as.character(covar_PHT$pathways_id), rownames(MEsPHT))
+```
+
+### Evaluate WGCNA-Phthalate Associations
+```{r}
+intmod_PHT <- lapply(colnames(PHT)[1:16], function(phthalate) {
+  lapply(colnames(MEsPHT), function(module) {
+  
+      temp <- cbind(module = MEsPHT[, module], covar_PHT)
+      
+      mod <- lm(scale(module) ~  h_c_sex + 
+                                 labor_collapsed +
+                                 h_del_method +
+                                 h_m_delivery_age + 
+                                 h_m_prepreg_bmi + 
+                                 h_m_ethn + 
+                                 race_collapsed + 
+                                 edu_collapsed +
+                                 parity_20 + 
+                                 SG +
+                  smoking_composite +
+                  batch + 
+                                 get(phthalate), 
+                data = temp)
+      
+      broom::tidy(lm(mod)) %>%
+        dplyr::mutate(module = rep(module, length(coefficients(mod))),
+                      phthalate = rep(phthalate, length(coefficients(mod))))
+  }) %>%
+  dplyr::bind_rows() 
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::filter(term == "get(phthalate)") %>%
+  dplyr::filter(module != "MEgrey") %>% ## unassigned module should not be included in analysis
+  dplyr::mutate(module = substring(module, 3)) %>%
+  dplyr::select(all_of(c("phthalate", "module", "estimate", "std.error", "statistic", "p.value"))) 
+  
+
+intmod_PHT %>%
+  dplyr::filter(p.value < 0.05) %>%
+  kable() %>%
+  kableExtra::kable_styling()
+
+sig_WGCNA <- intmod_PHT %>%
+  dplyr::filter(p.value<0.05)
+sig_WGCNA$phthalate <- toupper(sig_WGCNA$phthalate)
+
+```
+
+#### Write results
+
+```{r}
+#save(intmod_PHT, file = "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/phthalate_gapps_wgcna_results_071025.Rdata")
+#write.csv(sig_WGCNA, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SigWGCNA_071025.csv")
+
+```
+

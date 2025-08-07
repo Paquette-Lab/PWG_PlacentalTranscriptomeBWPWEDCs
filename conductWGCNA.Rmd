@@ -1,0 +1,194 @@
+---
+title: "PATHWAYS GAPPS Cohort-Wide WGCNA: Module Generation"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+#### Load libraries
+
+```{r}
+library(tidyverse)  ## tidy data framework, ggplot2, pipes
+library(here)       ## sets path nicely for markdown
+library(WGCNA)      ## many arguments throughout this workflow
+```
+
+#### Load Data
+
+```{r}
+set.seed(2023)
+
+load(file = here::here("Resubmission_July2024/intermediateData/cqn_data.Rds"))
+
+## check dimensions of data
+dim(RPKM_cqn)
+
+### WGCNA needs samples in rows and genes in columns
+cqn_expr_transpose <- t(RPKM_cqn)
+dim(cqn_expr_transpose)
+```
+
+## Conduct WGCNA
+
+#### Determine the soft-threshold
+
+Selecting the soft power by using values between 1 and 30 to select a relatively low soft power number that maximizes the R^2^ and minimizes mean connectivity (k mean).
+
+```{r}
+power <- c(c(1:10), seq(from= 12, to= 30, by= 2))
+#Maximum value allowed is 29
+
+softThreshold <- pickSoftThreshold(cqn_expr_transpose, powerVector=power, networkType="unsigned", verbose=5)
+```
+
+```{r}
+softThresh_data <- softThreshold$fitIndices
+
+#Plot to visualize R2 values (want to maximize this value in selecting the power for the soft threshold)
+R2plot <- ggplot(softThresh_data, aes(Power, SFT.R.sq, label=Power)) + 
+  geom_point() + 
+  geom_text(nudge_y=0.05)+
+  geom_hline(yintercept=0.85, color="red") + ## Sam used 0.85 for OPFR WGCNA
+  labs(x="Power", y="Scale free topology model fit, signed R^2") + 
+  theme_classic()
+
+R2plot
+
+#Plotting mean connectivity (want to minimize this value when selecting the power for the soft threshold)
+meanKplot<- ggplot(softThresh_data, aes(Power, mean.k., label=Power)) + 
+  geom_point() + 
+  geom_text(nudge_y= 1)+
+  labs(x="Power", y="Mean Connectivity") + 
+  theme_classic()
+meanKplot
+```
+
+With minimum mean connectivity and an R^2^ greater than 0.85, the soft power threshold is 20. 
+
+#### Calculate Adjacency
+
+```{r}
+# Set power for soft-threshold (see chunk above for details on selection)
+soft_power <- 20
+adjacency <- adjacency(cqn_expr_transpose, power = soft_power)
+```
+
+#### Calculate Topological Overlap Matrix (TOM)
+
+```{r}
+# Turn adjacency into topological overlap
+TOM <- TOMsimilarity(adjacency)
+
+## Dissimilarity
+dissTOM <- 1-TOM
+```
+
+#### Clustering with TOM dissimiliarity
+
+```{r}
+# Call the hierarchical clustering function
+geneTree <- hclust(as.dist(dissTOM), method = "average");
+
+# Plot the resulting clustering tree (dendrogram)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04)
+```
+
+#### Identify Modules with Dynamic Tree Cut
+
+```{r}
+# Default is 30, setting this to 20
+minModuleSize <- 20;
+
+# Module identification using dynamic tree cut:
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                             deepSplit = 2, pamRespectsDendro = FALSE,
+                             minClusterSize = minModuleSize);
+table(dynamicMods)
+
+# Convert numeric lables into colors
+dynamicColors <- labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+```
+
+#### Check module membership
+
+```{r}
+# Calculate eigengenes (matrix of samples in rows by modules in columns)
+MEList <- moduleEigengenes(cqn_expr_transpose, colors = dynamicColors)
+MEs <- MEList$eigengenes
+
+## confirm everything looks good
+MEList$allOK
+## were modules all principal components?
+MEList$allPC
+
+## look at MEs
+MEs[1:6, 1:6]
+
+## set up variables
+nSamples <- nrow(cqn_expr_transpose);
+moduleColors <- MEList$validColors;
+modNames <- substring(names(MEs), 3) ## another way to remove the ME prefix
+
+## determine gene module membership and association with trait (vitaminD)
+geneModuleMembership <- as.data.frame(cor(cqn_expr_transpose, MEs, use = "p"));
+MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples));
+names(geneModuleMembership) <- paste("MM", modNames, sep="");
+names(MMPvalue) <- paste("p.MM", modNames, sep="")
+
+## a matrix of correlations between genes and modules with 
+## genes in rows and modules in columns
+geneModuleMembership[1:6, 1:6]
+```
+
+## Save Data with ENSEMBL IDs
+
+```{r}
+save(annot, cqn_expr_transpose,
+     ## list of valid module colors
+     moduleColors, 
+     ## eigengenes for each sample
+     MEs, 
+     ## correlation between genes and eigengenes
+     geneModuleMembership,
+     file = here::here("Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_ensembl.RData"))
+
+## just in case
+save(MEList, file = here::here("Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_ensembl_fullObject.RData"))
+```
+
+## Save Data with HGNC gene symbols
+
+```{r}
+## sanity check: order of genes in expression data matches 
+## order of gene module membership data
+assertthat::are_equal(colnames(cqn_expr_transpose), rownames(geneModuleMembership))
+
+## is annotation in the same order as geneModuleMembership?
+assertthat::are_equal(as.character(annot$ENSEMBL), rownames(geneModuleMembership))
+
+## everything is in the same order, so we need to make
+## versions of MEs and geneModuleMembership with new
+## rownames using gene SYMBOL instead of ENSEMBL ID
+
+rownames(geneModuleMembership) <- annot$SYMBOL
+colnames(cqn_expr_transpose) <- annot$SYMBOL
+
+save(annot,
+     ## expression data, NOW WITH SYMBOL
+     cqn_expr_transpose,
+     ## list of valid module colors
+     moduleColors, 
+     ## eigengenes for each sample
+     MEs, 
+     ## correlation between genes and eigengenes, NOW WITH SYMBOL
+     geneModuleMembership,
+     file = here::here("Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_symbol.RData"))
+```

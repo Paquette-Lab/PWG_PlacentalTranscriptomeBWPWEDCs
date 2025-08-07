@@ -1,0 +1,137 @@
+---
+title: "GAPPS_MITM_Phthalate_PlacentalEfficiency_Birthweight"
+author: "Samantha Lapehn Young"
+date: "07/10/25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Meet in the Middle Analysis for GAPPS Phthalates and Placental Efficiency & Birthweight
+This code performs the meet in the middle (overlap) analysis for the phthalate and placental efficiency analyses (BWadj and BW:PW).
+
+NOTE:
+
+Mixture results are not included here.  
+
+Sex stratified results are not included here.  
+
+### Load Packages
+```{r load packages}
+library(tidyverse)
+library(pheatmap)
+```
+
+### Load Data
+Loading the following: 
+1) Phthalate Sig Results 
+2) Placental efficiency (BW:PW) and BW(adjusted for PW) DEGs
+```{r load data}
+PE_BW_DEGs <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/BWPW_ResultsfromMariana/sigResults_DEGS_SPLINES_ratio_birthweight_sex.csv")
+#Filter for just overall model
+PE_BW_DEGs <- PE_BW_DEGs %>%
+  dplyr::filter(analysis=="Overall")
+
+PHT_DEGs <-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/Phthalate_DEGs_GeoMean_071025.csv")
+summary(as.factor(PHT_DEGs$Phthalate))
+
+```
+
+
+### MITM: DEG Overlap
+```{r MITM DEGs}
+MITM <- inner_join(PE_BW_DEGs, PHT_DEGs, by=c("genes"), suffix=c("_PE", "_PHT"))
+dim(MITM)
+unique(MITM$genes)
+#Filter to only needed columns
+MITM_select <- MITM %>%
+  dplyr::select(genes, logFC_PE, outcome, logFC_PHT, Phthalate)
+
+#Rearrange data for heatmap
+PE_MITM <- MITM_select %>%
+  dplyr::select(genes, logFC_PE, outcome)
+colnames(PE_MITM) <- c("genes", "EffectEstimate", "Analysis")
+
+PHT_MITM <- MITM_select %>%
+  dplyr::select(genes, logFC_PHT, Phthalate)
+colnames(PHT_MITM) <- c("genes", "EffectEstimate", "Analysis")
+
+#Row Bind
+MITM_combined <- rbind(PE_MITM, PHT_MITM)
+
+#Rearrange
+wide_df <- pivot_wider(MITM_combined, names_from = Analysis, values_from = EffectEstimate)
+cols_to_fix <- c("Birthweight", "MCINP")
+
+wide_df <- wide_df %>%
+  mutate(across(all_of(cols_to_fix), ~ map_dbl(.x, ~ if (length(.x) > 0 && !is.null(.x)) .x[1] else NA_real_)))
+
+#write.csv(wide_df, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/MITM_PE_Phthalate_DEGOverlap_071025.csv")
+
+```
+### MITM Heatmap
+```{r heatmap}
+MITM_forHeatmap <- wide_df
+rownames(MITM_forHeatmap) <- MITM_forHeatmap$genes
+MITM_forHeatmap <- MITM_forHeatmap %>%
+  dplyr::select(-genes)
+MITM_forHeatmap <- MITM_forHeatmap %>%
+  mutate(row_average = rowMeans(MITM_forHeatmap, na.rm = TRUE))
+MITM_forHeatmap$genes <- wide_df$genes
+
+names(MITM_forHeatmap)[names(MITM_forHeatmap) == "Birthweight"] <- "BW(adj)"
+
+MITM_forHeatmap <- MITM_forHeatmap %>%
+  # Sort by row_average
+  arrange(row_average) %>%
+  # Remove row_average column
+  select(-row_average)
+MITM_forHeatmap <- as.data.frame(MITM_forHeatmap)
+rownames(MITM_forHeatmap) <- MITM_forHeatmap$genes
+MITM_forHeatmap <- MITM_forHeatmap %>%
+  dplyr::select(-genes)
+MITM_forHeatmap <- t(MITM_forHeatmap)
+breaks_seq <- seq(-.3, .3, length.out = 31)
+pheatmap(MITM_forHeatmap,
+         color = colorRampPalette(c("#0092B3", "White","#F09062"))(31),
+         scale='none',# unscaled data
+         na.color="lightgray",
+         cluster_rows =F,
+         cluster_cols=F,
+         na_col="lightgray",
+         cellwidth=20, #Change tehe for size
+         cellheight=20, #change these for size
+         gaps_row = c(2),
+         treeheight_row = 0,
+         fontsize_col = 15, 
+         fontsize_row=15,
+         fontsize=15,
+         #annotation_row = annotation,
+         #annotation_colors =annotation_colors,
+         display_numbers = F, 
+         breaks=breaks_seq)
+```
+
+### MITM Directionality Plot
+```{r}
+library(ggrepel)
+ggplot(MITM, aes(x = logFC_PE, y = logFC_PHT)) +
+  geom_point() +
+  geom_text_repel(aes(label = genes), size = 4, max.overlaps = Inf) +  # no limit on overlaps
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  xlim(-0.04, 0.02) +
+  ylim(-0.05, 0.25) +
+  theme_bw() + 
+  ylab("MCINP - Beta Coefficient") + 
+  xlab("Birthweight(adj)- Beta Coefficient")
+```
+
+
+
+
+

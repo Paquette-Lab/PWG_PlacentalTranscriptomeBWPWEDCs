@@ -1,0 +1,2170 @@
+---
+title: "Placental Efficiency: Placenta Weight, Birthweight, and Gene Expression"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+## Aims
+
+(a) Clean data for placental efficiency and placental gene expression analyses
+(b) Visualize the relationship between placental weight (PW), birthweight (BW), and the BW:PW ratio
+(c) Evaluate the associations between placental protein-coding gene expression and *i*) PW, *ii*) BW adjusted for PW (BW~adj~), and *iii*) BW:PW 
+(d) Evaluate the role of fetal sex as an effect modifier for the relationships between gene expression and PW, BW~adj~, and BW:PW, as well as between PW and BW.
+
+## Covariate Data Cleaning
+
+#### Load Packages
+
+```{r load packages}
+library(tidyverse)
+library(here)
+library(assertthat)
+library(edgeR)
+library(kableExtra) 
+library(arsenal)
+library(ggrepel)
+library(ggh4x)
+library(ggtext)
+library(splines)
+library(mgcv)
+library(gratia)
+library(ggpubr)
+```
+
+#### Load Data 
+
+Load the new data from the most recent pulls. 
+
+```{r}
+## load full covariate data
+full_covar <- read_csv(file = here::here("Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4_25_2024/req_05_data.csv"))
+
+## load birthweight Z score data, which also has calculated placental_fetal_weight ratio
+zscores <- read_csv(file = here::here("Resubmission_July2024", "intermediateData", "all_birthweightZscores_fetalPlacentalRatios.csv"))
+
+## load RNA seq
+load(here::here("Resubmission_July2024/NEW_RawData/gapps_20240325.Rdata"))
+
+## load exposure for cotinine measurements
+## values are already log-transformed
+load("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/intermediateData/CleanedExposureData_AGP_April192024.RData")
+
+## remove unnecessary variables:
+rm(PAH_SG, PHT_SG, PAH, PHT)
+```
+
+First, we need to attach the RNA-sequencing analysis batch and birthweight z-scores to the covariate data. 
+
+```{r}
+## attach batches to covar
+## match batches data to pathways_id 
+batches$pathways_id <- colnames(counts$counts)
+
+covar <- dplyr::full_join(full_covar, 
+                          ## join batches
+                          batches |> dplyr::select(c(pathways_id, batch = Analysis)),
+                          by = join_by(pathways_id)) |>
+  ## join fetal placental ratio from z-scores
+  dplyr::full_join(
+    zscores |> 
+      dplyr::select(pathways_id, fetal_placental_ratio, 
+                    placenta_weight = m_pl1_weight, birthweight = h_birthweight_g), 
+    by = join_by(pathways_id)) |>
+  ## join cotinine data so we can build the smoking status variable
+  dplyr::full_join(
+    Cotinine |> 
+      dplyr::select(pathways_id, cotinine, cotinine_yn),
+    by = join_by(pathways_id))
+```
+
+Second, we need to remove the `8888` codings for NAs (see data dictionary) and convert them to `NA` that R can interpret.
+
+```{r}
+covar <- covar |>
+   mutate(across(where(is.numeric), ~ na_if(., 8888)))
+```
+
+Third, we need to generate the cleaned hypertension and gestation diabetes variables. The data were collected under 2 protocols ("old" and "new", see data dictionary).
+
+```{r}
+covar_old <- covar |>
+  ## filter by protocol type, old
+  dplyr::filter(mra_protocol == 0) |>
+  dplyr::mutate(
+    ## make chronic hypertension variable
+    chronic_htn = dplyr::if_else(mra_old_m_category___12 == 1 | mra_old_m_medical_history___3 == 1, 1, 0),
+    ## now make hypertensive disorders of pregnancy variable
+    ## NAs from new protocol are retained
+    htn_pregnancy = dplyr::if_else(h_preeclam_currpreg == 1 | h_gesthtn_currpreg == 1 | chronic_htn == 1,
+                              1, 0),
+    ## now make GDM variable
+    gdm = dplyr::if_else(mra_old_m_diabete_type == 3 & is.na(mra_old_m_diabete_type) == FALSE, 1, 0)
+  )
+
+covar_new <- covar |>
+  ## filter by protocol type, new
+  dplyr::filter(mra_protocol == 1) |>
+  dplyr::mutate(
+    ## make chronic hypertension variable
+    chronic_htn = dplyr::if_else(mra_new_m_category___12 == 1, 1, 0),
+    ## now make hypertensive disorders of pregnancy variable
+    ## NAs from old protocol are retained
+    htn_pregnancy = dplyr::if_else(h_preeclam_currpreg == 1 | h_gesthtn_currpreg == 1 | chronic_htn == 1,
+                              1, 0),
+    ## now make GDM variable
+    gdm = dplyr::if_else(mra_new_m_category___53 == 1 & is.na(mra_new_m_category___53) == FALSE, 1, 0)
+  )
+
+covar_cleaned <- dplyr::bind_rows(covar_old, covar_new) 
+```
+
+Fourth, filter based on exclusion criteria.
+
+```{r filterMissingRNAseq}
+## original dimensions
+dim(covar_cleaned)
+
+covar_rnaseq <- covar_cleaned |>
+  ## n = 702
+  ## one row is duplicated for some reason
+  dplyr::distinct() |>
+  ## n = 701
+  ## For the samples that were run twice, retain original run (in batches 1-3) 
+  ## and remove the run in the fourth batch (arrange by batch, then take only 
+  ## the first sample)
+  dplyr::arrange(batch) |>
+  dplyr::group_by(pathways_id) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  ## n = 673
+  ## now, only samples with RNA-seq data
+  dplyr::filter(pathways_id %in% colnames(lengthScaledTPM$counts)) |>
+  ## 465
+  ## Two participants have BMIs set to zero, so change those to NA
+  dplyr::mutate(h_m_prepreg_bmi = dplyr::if_else(h_m_prepreg_bmi == 0, NA, h_m_prepreg_bmi)) |>
+  ## make the smoking status variable: 
+  dplyr::mutate(smoking_composite = dplyr::case_when(
+    ## if self-report, yes
+    h_m_enroll_smoke == 1 ~ 1, 
+    ## if self-report no or no report but cotinine == yes, yes
+    (h_m_enroll_smoke == 0 | is.na(h_m_enroll_smoke) == TRUE) & cotinine_yn == 1 ~ 1, 
+    ## if self-report no and cotinine == no or cotinine is NA, no
+    h_m_enroll_smoke == 0 & (is.na(cotinine_yn) == TRUE | cotinine_yn == 0) ~ 0, 
+    ## else, everything must be NA, so NA
+    is.na(h_m_enroll_smoke) == TRUE & (is.na(cotinine_yn) == TRUE | cotinine_yn == 0) ~ NA
+    ))
+
+dim(covar_rnaseq)
+```
+
+Fifth, format the factors as needed: add human readable labels, set orders for any ordered factors, and (if not ordered) set the largest group as reference.
+
+```{r}
+covar_rnaseq <- within(covar_rnaseq, {
+  protocol <- factor(protocol, labels = c("Old", "New"))
+  mra_protocol <- factor(mra_protocol, labels = c("Old", "New"))
+  site <- factor(site, labels = c("UW", "Swedish", "Yakima"))
+  h_c_sex <- factor(h_c_sex) %>% ## relevel
+    relevel(ref = "M") ## more males than females
+  h_m_race <- factor(h_m_race, labels = c("White", "Black_AA", "Asian",
+                                          "NI_AN", "Multiple", "Other"))
+  race_collapsed <- dplyr::if_else(h_m_race %in% c("NI_AN", "Multiple"), 
+                                   "Other", 
+                                   h_m_race) |>
+    factor() %>%
+    relevel(ref = "White")
+  h_m_ethn <- factor(h_m_ethn, labels = c("Not Hispanic", "Hispanic or Latino"))
+  h_m_enroll_educ <- factor(h_m_enroll_educ, labels =  c("<HS", "HS graduate", "Graduated college/technical school", "Some graduate work or degree")) |>
+    ## college grad is largest group
+    relevel(ref = "Graduated college/technical school")
+  edu_collapsed <- dplyr::if_else(h_m_enroll_educ %in% c("Graduated college/technical school", "Some graduate work or degree"),
+                                  0,  ## college graduate or higher as reference
+                                  1) |>
+    factor()
+  h_m_enroll_smoke <- factor(h_m_enroll_smoke, labels = c("No", "Yes"))
+  smoking_composite <- factor(smoking_composite, labels = c("No", "Yes"))
+  cg_labor_type <- factor(cg_labor_type, labels = c("Spontaneous", "Augmented", "Induced", "No labor"))
+  labor_collapsed <- dplyr::if_else(cg_labor_type == "No labor", 
+                                    "No labor",
+                                    "Labored") |>
+    factor(levels = c("Labored", "No labor"))
+  h_del_method <- factor(h_del_method, labels = c("Vaginal", "C-section"))
+  gdm <- factor(gdm, labels = c("No", "Yes"))
+  htn_pregnancy <- factor(htn_pregnancy, labels = c("No", "Yes"))
+  batch <- factor(batch, levels = c(4, 1:3)) ## batch 4 is largest
+  }) 
+```
+
+Sixth, filter participants missing covariates included in these models.
+
+```{r}
+covar_ratio <- covar_rnaseq |>
+  # n = 465
+  ## also remove multifetal gestations and abruptions
+  dplyr::filter(h_placental_abrupt == 0 | is.na(h_placental_abrupt) == TRUE) |>
+  ## n = 425; 451 when retaining NAs
+  dplyr::filter(h_multi_gest == 0 | is.na(h_multi_gest) == TRUE) |>
+  ## n = 413; 438 when retaining NAs
+  dplyr::select(pathways_id, protocol, site, batch, h_c_sex, h_m_delivery_age, 
+                race_collapsed, h_m_ethn, edu_collapsed, h_m_prepreg_bmi, smoking_composite,
+                parity_20, htn_pregnancy, gdm, labor_collapsed, h_del_method,
+                fetal_placental_ratio, placenta_weight, birthweight,
+                ## extras for table1
+                h_birth_gestage, h_m_race, h_m_enroll_educ) |>
+  ## drop missing values for outcomes (ratio encompasses all)
+  tidyr::drop_na(fetal_placental_ratio) |>
+  ## N=325
+  ## drop missing values for covariates or outcome
+  tidyr::drop_na(any_of(c("batch", "h_c_sex", "h_m_delivery_age", 
+                "race_collapsed", "h_m_ethn", "edu_collapsed", "h_m_prepreg_bmi", 
+                "parity_20", "htn_pregnancy", "gdm", "labor_collapsed", 
+                "h_del_method", "smoking_composite"))) |>
+  ## site is also split by city:
+  dplyr::mutate(
+    site_2 = dplyr::case_match(site, 
+                               "Yakima" ~ "Yakima", 
+                               "Swedish" ~ "Seattle", 
+                               "UW" ~ "Seattle") |> factor()
+    )
+
+
+dim(covar_ratio)
+```
+
+Clean environment, remove the intermediate covariate data frames
+
+```{r}
+rm(covar, covar_new, covar_old, covar_cleaned)
+```
+
+#### Now, generate population characteristic tables
+
+First, generate table 1, the population demographics for the 253 participatns in the placental efficiency analyses.
+
+```{r, results='asis'}
+tab1 <- tableby( ~ h_m_delivery_age +
+                   h_m_prepreg_bmi +
+                   h_birth_gestage + 
+                   birthweight +
+                   placenta_weight +
+                   fetal_placental_ratio +
+                   site +
+                   site_2 +
+                   batch +
+                   h_c_sex +
+                   labor_collapsed +
+                   h_del_method +
+                   h_m_enroll_educ +
+                   edu_collapsed +
+                   smoking_composite +
+                   h_m_race +
+                   race_collapsed + 
+                   h_m_ethn,
+                 data = covar_ratio, 
+                 numeric.test = "kwt", cat.test = "chisq",
+                 numeric.stats = c("median", "q1q3", "range", "sd", "Nmiss"),
+                 cat.stats = c("countpct", "Nmiss"))
+
+summary(tab1)
+```
+
+Now, generate data for supplementary table 1, with the comparison of the full PATHWAYS GAPPS cohort and the complete subset with RNA sequencing data. 
+
+```{r, results='asis'}
+supp_tab1_df <- full_covar |>
+  dplyr::mutate(across(where(is.numeric), ~ na_if(., 8888))) |>
+  ## some issues with unreasonable maternal BMIs (= 0)
+  dplyr::mutate(h_m_prepreg_bmi = dplyr::if_else(h_m_prepreg_bmi == 0, NA, h_m_prepreg_bmi)) |>
+  dplyr::full_join(Cotinine |> dplyr::select(pathways_id, cotinine, cotinine_yn),
+                   by = join_by(pathways_id)) |>
+  dplyr::mutate(smoking_composite = dplyr::case_when(
+    h_m_enroll_smoke == 1 ~ 1, ## if self-report, yes
+    ## if self-report no or no report but cotinine == yes, yes
+    (h_m_enroll_smoke == 0 | is.na(h_m_enroll_smoke) == TRUE) & cotinine_yn == 1 ~ 1, 
+    ## if self-report no and cotinine == no or cotinine is NA, no
+    h_m_enroll_smoke == 0 & (is.na(cotinine_yn) == TRUE | cotinine_yn == 0) ~ 0, 
+    ## else, everything must be NA, so NA
+    is.na(h_m_enroll_smoke) == TRUE & (is.na(cotinine_yn) == TRUE | cotinine_yn == 0) ~ NA
+    )) |>
+  within({
+    protocol <- factor(protocol, labels = c("Old", "New"))
+    mra_protocol <- factor(mra_protocol, labels = c("Old", "New"))
+    site <- factor(site, labels = c("UW", "Swedish", "Yakima"))
+    h_c_sex <- factor(h_c_sex) |> ## relevel
+      relevel(ref = "M") ## more males than females
+    h_m_race <- factor(h_m_race, labels = c("White", "Black_AA", "Asian", "HN_PI",
+                                            "AI_AN", "Multiple", "Other"))
+    race_collapsed <- dplyr::if_else(h_m_race %in% c("NI_AN", "Multiple", "HN_PI"), 
+                                     "Other", 
+                                     h_m_race) |>
+      factor() |>
+      relevel(ref = "White")
+    h_m_ethn <- factor(h_m_ethn, labels = c("Not Hispanic", "Hispanic or Latino"))
+    h_m_enroll_educ <- factor(h_m_enroll_educ, labels =  c("<HS", "HS graduate", "Graduated college/technical school", "Some graduate work or degree")) |>
+      ## college grad is largest group
+      relevel(ref = "Graduated college/technical school")
+    edu_collapsed <- dplyr::if_else(h_m_enroll_educ %in% c("Graduated college/technical school", "Some graduate work or degree"),
+                                    0,  ## college graduate or higher as reference
+                                    1) |>
+      factor()
+    h_m_enroll_smoke <- factor(h_m_enroll_smoke, labels = c("No", "Yes"))
+    smoking_composite <- factor(smoking_composite, labels = c("No", "Yes"))
+    h_del_method <- factor(h_del_method, labels = c("Vaginal", "C-section"))
+  }) |>
+  dplyr::mutate(included = dplyr::if_else(pathways_id %in% covar_rnaseq$pathways_id, 
+                                          "included", 
+                                          "excluded") |> 
+                  factor(),
+                labor_collapsed = dplyr::if_else(cg_labor_type == 4, 
+                                    "No labor",
+                                    "Labored") |> factor(levels = c("Labored", "No labor"))) |>
+  dplyr::mutate(
+    site_2 = dplyr::case_match(site, 
+                               "Yakima" ~ "Yakima", 
+                               "Swedish" ~ "Seattle", 
+                               "UW" ~ "Seattle") |> factor()
+    ) |>
+  dplyr::left_join(zscores |> dplyr::select(pathways_id, birthweight = h_birthweight_g, placenta_weight = m_pl1_weight, fetal_placental_ratio),
+                   by = join_by(pathways_id))
+
+supp_tab1 <- tableby(included ~ 
+                   h_m_delivery_age +
+                   h_m_prepreg_bmi +
+                   h_birth_gestage + 
+                   birthweight +
+                   placenta_weight +
+                   fetal_placental_ratio +
+                   site +
+                   site_2 +
+                   h_c_sex +
+                   labor_collapsed +
+                   h_del_method +
+                   h_m_enroll_educ +
+                   edu_collapsed +
+                   h_m_enroll_smoke +
+                   smoking_composite +
+                   race_collapsed +
+                   h_m_race +
+                   h_m_ethn,
+                 data = supp_tab1_df, 
+                 numeric.test = "kwt", cat.test = "chisq",
+                 numeric.stats = c("median", "q1q3", "Nmiss"),
+                 cat.stats = c("countpct", "Nmiss"))
+
+summary(supp_tab1)
+
+
+## clean environment: remove batches, Cotinine
+rm(batches, Cotinine)
+```
+
+## RNA-seq Data Cleaning
+
+Start by removing the duplicated sample and the NovoSeq results from the samples that were run on both instruments, using length scaled TPM values.
+
+```{r}
+## remove the batch 4 duplicates
+LS_Counts <- lengthScaledTPM$counts[, -ind[[2]]]
+
+## check if duplicated names
+colnames(LS_Counts)[duplicated(colnames(LS_Counts))]
+dim(LS_Counts)
+
+## remove duplicate
+LS_Counts <- LS_Counts[, -which(duplicated(colnames(LS_Counts)))]
+
+## confirm duplicate removed
+colnames(LS_Counts)[duplicated(colnames(LS_Counts))]
+dim(LS_Counts)
+```
+
+We will follow these steps in this order. 
+
+1. Remove participants that don't have full covariate data
+2. Removed Enzembl IDs with the suffix "_PAR_Y"  
+3. Remove non-protein coding genes
+4. Performed Filtering on genes with mean cpm<0  
+5. Removed Duplicated Genes  
+6. TMM Normalization 
+
+```{r filtering}
+## Original Dimensions
+dim(LS_Counts)
+dim(annot)
+
+## Retain only complete cases (using covar_ratio) ####
+LS_Counts <- LS_Counts[, covar_ratio$pathways_id]
+
+## Dimensions after filtering for complete cases
+dim(LS_Counts)
+
+## Remove Ensembl IDs with the suffix "_PAR_Y" ####
+LS_Counts <- LS_Counts[!grepl("_PAR_Y", rownames(LS_Counts)), ]
+annot$ENSEMBL <- as.character(annot$ENSEMBL)
+annot <- annot[!grepl("_PAR_Y",annot$ENSEMBL), ]
+
+## Dimsenions after "_PAR_Y" removal
+dim(LS_Counts)
+dim(annot)
+
+## get rownames of count dataset to match annot$ENSEMBL by removing the "." and 
+## everything after it
+rownames(LS_Counts) <- gsub("\\..*", "", rownames(LS_Counts))
+
+## Retain only protein coding genes ####
+## filter the annot file
+annot <- subset(annot, BIOTYPE == "protein_coding") %>%
+  droplevels()
+
+## then filter based on what remains in annotation file
+LS_Counts <- LS_Counts[as.character(annot$ENSEMBL), ]
+
+## Dimensions retaining only protein coding genes
+dim(LS_Counts)
+dim(annot)
+
+## Remove genes with low expression ####
+## Keep genes with average log cpm>0
+logcpm <- cpm(LS_Counts, log = T)
+
+keep <- rowMeans(logcpm) > 0
+summary(keep)
+
+logcpm_filt <- logcpm[keep, ]
+LS_Counts_filt<-LS_Counts[keep, ]
+annot <- annot[keep, ]
+
+## Plot before and after filtering out low expressing genes
+
+plot(density(logcpm), main = "Before Removing low expressing genes")
+abline(v = 0, col = "red", lty = 2)
+
+plot(density(logcpm_filt), main = "After Removing low expressing genes")
+abline(v = 0, col = "red", lty = 2)
+
+## Dimensions after low expression filtering
+dim(LS_Counts_filt)
+dim(annot)
+dim(logcpm_filt)
+
+## Remove duplicated genes ####
+summary(duplicated(logcpm_filt))
+
+dupgenes <-as.character(annot[annot$ENSEMBL %in% rownames(logcpm_filt)[duplicated(logcpm_filt)], "SYMBOL"])
+dupgenes
+
+annot<-annot[-which(annot$SYMBOL%in%dupgenes),]
+logcpm_filt<-logcpm_filt[-which(duplicated(logcpm_filt)),]
+LS_Counts_filt<-LS_Counts_filt[-which(duplicated(LS_Counts_filt)),]
+
+## Dimensions after removing duplicates
+dim(LS_Counts_filt)
+dim(logcpm_filt)
+dim(annot)
+```
+
+Then conduct TMM normalization.
+
+```{r TMM Norm}
+#Make DGEList
+Y <- DGEList(counts = LS_Counts_filt, genes = annot$SYMBOL)
+
+Y_norm <- calcNormFactors(Y, method = "TMM") #This is the Default Method
+
+#Plot before and after normalization
+boxplot(cpm(Y ,log = T)[, 1:10], main = "Before Normalization")
+
+boxplot(cpm(Y_norm, log = T)[, 1:10], main = "After Normalization")
+```
+
+Clean environment
+
+```{r}
+rm(ind, int,
+   lengthScaledTPM, logcpm, logcpm_filt, LS_Counts, LS_Counts_filt,
+   dupgenes, keep, Y)
+```
+
+## Association between placental weight and birthweight
+
+#### Visualize the relationship between placental weight and birthweight
+
+First, plot birthweight against placental weight and used the BW:PW ratio to color the points. Use the default LOESS curve to visualize the relationship. 
+
+```{r fig.width=4, fig.height=4}
+covar_ratio |>
+  ggplot() +
+  aes(x = placenta_weight, y = birthweight, color = fetal_placental_ratio) +
+  ## axes
+  xlab("Placenta weight, g") +
+  ylab("Birthweight, g") +
+  ## data
+  geom_point() +
+  ## fit a model of the UNADJUSTED results
+  stat_smooth(method = "loess", 
+              formula = y ~ x,
+              color = "deepskyblue", fill = "skyblue") +
+  ## update scales
+  scale_color_gradientn(colors = scico::scico(31, palette = "batlow"),
+                        name = "BW:PW", trans = "log10") +
+  ## theme
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+```
+
+This relationship appears to be non-linear. We will use a natural cubic spline (the boundary points have a penalty imposed so the relationship is linear beyond the data range). The `mgcv` package provides an estimate of the effective degrees of freedom (EDF): values close to 1 indicate linearity, values close to 2 or higher indicate non-linearity (higher EDF values indicate a greater degree of non-linearity).
+
+```{r fig.width=4, fig.height=4}
+unadj_mod <- mgcv::gam(birthweight ~ 
+                        s(placenta_weight, bs="cr", k = 4), 
+                   data = covar_ratio |>
+                     dplyr::mutate(
+                       # birthweight = scale(birthweight),
+                       placenta_weight = scale(placenta_weight)
+                     ),
+                   method = "REML")
+
+summary(unadj_mod)
+
+gam.check(unadj_mod)
+plot(unadj_mod)
+```
+
+Now, confirm the association after adjusting for covariates.
+
+```{r fig.width=4, fig.height=4}
+adjust_mod_N253 <- mgcv::gam(birthweight ~ 
+                        s(placenta_weight, bs="cr", k = 4) +
+                        h_c_sex +
+                        h_m_delivery_age + 
+                        h_m_prepreg_bmi +           
+                        h_m_ethn + 
+                        race_collapsed + 
+                        edu_collapsed +
+                        smoking_composite + 
+                        parity_20 +
+                        gdm + 
+                        htn_pregnancy, 
+                   data = covar_ratio |>
+                     dplyr::mutate(
+                       # birthweight = scale(birthweight),
+                       placenta_weight = scale(placenta_weight), 
+                       age = scale(h_m_delivery_age),
+                       bmi = scale(h_m_prepreg_bmi), 
+                       par = scale(parity_20)
+                     ),
+                   method = "REML")
+
+adjust_mod_N253
+summary(adjust_mod_N253)
+
+gam.check(adjust_mod_N253)
+plot(adjust_mod_N253)
+```
+
+This model has nearly 3 EDF, supporting a nonlinear association. 
+Now, plot these results using `ggplot2` so we can format the points and use color to see how the BW:PW ratio is related to the BW~adj~ residuals.
+
+```{r fig.width=6.5, fig.height=4}
+## try natural cubic spline instead of LOESS
+unadj_nonlinear_plot <- covar_ratio |>
+  ggplot() +
+  aes(x = placenta_weight, y = birthweight, color = fetal_placental_ratio) +
+  ## axes
+  xlab("Placenta weight, g") +
+  ylab("Birthweight, g") +
+  ## data
+  geom_point() +
+  ## fit a model of the UNADJUSTED results
+  stat_smooth(method = mgcv::gam, 
+              formula = y ~ s(x, bs="cr", k = 4),
+              method.args = list(method = "REML"),
+              color = "deepskyblue", fill = "skyblue") +
+  ## update scales
+  scale_color_gradientn(colors = scico::scico(31, palette = "batlow"),
+                        name = "BW:PW", trans = "log10") +
+  ## theme
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+## make pretty figures
+## get smooth for ggplot
+sm <- gratia::smooth_estimates(adjust_mod_N253, select = "s(placenta_weight)") |>
+  ## back transform so this results are interpretable
+  dplyr::mutate(unscaled_pw = (placenta_weight * 124.1917) + 457.9605) 
+
+## get partial residuals for ggplot points
+pr <- gratia::partial_residuals(adjust_mod_N253, select = "s(placenta_weight)") |>
+  dplyr::mutate(placenta_weight = scale(covar_ratio$placenta_weight) |> as.vector(),
+                ratio = covar_ratio$fetal_placental_ratio) |>
+  ## back transform so this results are interpretable
+  dplyr::mutate(unscaled_pw = (placenta_weight * 124.1917) + 457.9605) 
+
+## make figure
+adjusted_nonlinear_plot <- sm |>
+  add_confint() |>
+  ggplot(aes(y = .estimate, x = unscaled_pw)) +
+  geom_point(data = pr, 
+             aes(x = unscaled_pw, y = `s(placenta_weight)`, 
+                 color = ratio)) +
+  geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci),
+    alpha = 0.2, fill = "deepskyblue"
+  ) +
+  geom_line(colour = "deepskyblue", linewidth = 1) +
+  ## axes
+  labs(
+    y = "Birthweight, g",
+    x = "Placental weight, g"
+  ) +
+  ## update scales
+  scale_color_gradientn(colors = scico::scico(31, palette = "batlow"),
+                        name = "BW:PW", trans = "log10") +
+  ## theme
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+ggpubr::ggarrange(unadj_nonlinear_plot,
+                  adjusted_nonlinear_plot,
+                  ncol = 2, 
+                  labels = "AUTO",
+                  widths = c(3, 3),
+                  common.legend = TRUE, 
+                  legend = "bottom")
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "BW_PW_ratio_spline_figure.pdf"),
+       width = 6.5, height = 4, units = "in")
+```
+
+In the adjusted model, the relationship appears to become negative around ~580 g, but it should be noted that a horizontal line could be drawn straight through the confidence interval between ~500-~1000 grams, suggesting that the relationship might simply plataeu. It is also possible the the two samples with the highest placental weights have leverage and are driving the nonlinear association. We will test that possibility in a sensitivity analysis in the next section.
+
+```{r}
+covar_ratio |>
+  dplyr::mutate(birthweight_resid = residuals(unadj_mod)) |>
+  ggplot() +
+  aes(x = fetal_placental_ratio, y = birthweight_resid) +
+  ## label and format axes
+  xlab("BW:PW") +
+  ylab("Birthweight residuals, g") +
+  ## data
+  geom_point(color = "gray") +
+  theme_minimal(base_size = 10)
+
+with(
+  covar_ratio |>
+    dplyr::mutate(birthweight_resid = residuals(unadj_mod)), 
+  cor.test(birthweight_resid, fetal_placental_ratio, method = "spearman")
+  )
+```
+
+The fetal-placental weight ratio (BW:PW, placental efficiency) is correlated with birth weight (after regressing on the smoothed placental term).
+
+We are also interested in the potential role of fetal sex as an effect modifier. 
+
+```{r fig.width=8, fig.height=4}
+exploratory_mod_bw_sex <- mgcv::gam(birthweight ~ s(placenta_weight, 
+                                          by = h_c_sex,
+                                          bs = "cr",
+                                          k = 4) +
+                      h_c_sex + 
+                      h_m_delivery_age + 
+                      h_m_prepreg_bmi +                    
+                      h_m_ethn + 
+                      race_collapsed + 
+                      edu_collapsed +
+                      smoking_composite + 
+                      parity_20 +
+                      gdm + 
+                      htn_pregnancy, 
+                   data = covar_ratio |>
+                     dplyr::mutate(
+                       # birthweight = scale(birthweight),
+                       placenta_weight = scale(placenta_weight), 
+                       age = scale(h_m_delivery_age),
+                       bmi = scale(h_m_prepreg_bmi), 
+                       par = scale(parity_20)
+                     ),
+                   method = "REML")
+
+exploratory_mod_bw_sex
+summary(exploratory_mod_bw_sex)
+
+
+## set up plots
+par(mfrow = c(1, 2))
+
+gam.check(exploratory_mod_bw_sex)
+
+plot(exploratory_mod_bw_sex)
+
+## return plots
+par(mfrow = c(1, 1))
+```
+
+#### Sensitivity Analysis without the 2 highest placental weights
+
+```{r}
+covar_sens <- covar_ratio |>
+  dplyr::filter(!placenta_weight > 800)
+
+adjust_mod_N251 <- mgcv::gam(birthweight ~ 
+                        s(placenta_weight, bs="cr", k = 4) +
+                        h_c_sex +
+                        h_m_delivery_age + 
+                        h_m_prepreg_bmi +           
+                        h_m_ethn + 
+                        race_collapsed + 
+                        edu_collapsed +
+                        smoking_composite + 
+                        parity_20 +
+                        gdm + 
+                        htn_pregnancy, 
+                   data = covar_sens |>
+                     dplyr::mutate(
+                       # birthweight = scale(birthweight),
+                       placenta_weight = scale(placenta_weight), 
+                       age = scale(h_m_delivery_age),
+                       bmi = scale(h_m_prepreg_bmi), 
+                       par = scale(parity_20)
+                     ),
+                   method = "REML")
+
+adjust_mod_N251
+summary(adjust_mod_N251)
+
+gam.check(adjust_mod_N251)
+plot(adjust_mod_N251)
+```
+
+Now, plot alongside the adjusted results in the main analysis (N=253)
+
+```{r, fig.width=6.5, fig.height=2.5}
+## make pretty figures
+## get smooth for ggplot
+sm_N251 <- gratia::smooth_estimates(adjust_mod_N251, select = "s(placenta_weight)") |>
+  ## back transform so this results are interpretable
+  dplyr::mutate(unscaled_pw = (placenta_weight * 117.4206) + 454.255) 
+
+## get partial residuals for ggplot points
+pr_N251 <- gratia::partial_residuals(adjust_mod_N251, select = "s(placenta_weight)") |>
+  dplyr::mutate(placenta_weight = scale(covar_sens$placenta_weight) |> as.vector(),
+                ratio = covar_sens$fetal_placental_ratio) |>
+  ## back transform so this results are interpretable
+  dplyr::mutate(unscaled_pw = (placenta_weight * 117.4206) + 454.255) 
+
+## make figure
+adjusted_nonlinear_plot_N251 <- sm_N251 |>
+  add_confint() |>
+  ggplot(aes(y = .estimate, x = unscaled_pw)) +
+  geom_point(data = pr_N251, 
+             aes(x = unscaled_pw, y = `s(placenta_weight)`, 
+                 color = ratio)) +
+  geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci),
+    alpha = 0.4, fill = "deepskyblue"
+  ) +
+  geom_line(colour = "deepskyblue", linewidth = 1) +
+  ## axes
+  labs(
+    y = "Birthweight",
+    x = "Placental weight, g"
+  ) +
+  ## update scales
+  scale_color_gradientn(colors = scico::scico(31, palette = "batlow"),
+                        name = "BW:PW", trans = "log10") +
+  ## theme
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+ggpubr::ggarrange(unadj_nonlinear_plot + xlim(100, 1000), 
+                  adjusted_nonlinear_plot + xlim(100, 1000),
+                  adjusted_nonlinear_plot_N251 + xlim(100, 1000),
+                  ncol = 3, 
+                  labels = "AUTO",
+                  font.label = list(size=10),
+                  common.legend = TRUE, 
+                  legend = "right")
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "BW_PW_ratio_spline_figure_N253_N251.pdf"),
+       width = 6.5, height = 2.5, units = "in")
+```
+
+In both cases, we have a mostly linear relationship between placental weight and birthweight until approximately ~500 g, at which point the relationship changes. In both cases, the confidence intervals are consistent with a leveling off. 
+
+```{r fig.width=8, fig.height=4}
+exploratory_mod_bw_sex_N251 <- mgcv::gam(birthweight ~ s(placenta_weight, 
+                                          by = h_c_sex,
+                                          bs = "cr",
+                                          k = 4) +
+                      h_c_sex + 
+                      h_m_delivery_age + 
+                      h_m_prepreg_bmi +                    
+                      h_m_ethn + 
+                      race_collapsed + 
+                      edu_collapsed +
+                      smoking_composite + 
+                      parity_20 +
+                      gdm + 
+                      htn_pregnancy, 
+                   data = covar_sens |>
+                     dplyr::mutate(
+                       # birthweight = scale(birthweight),
+                       placenta_weight = scale(placenta_weight), 
+                       age = scale(h_m_delivery_age),
+                       bmi = scale(h_m_prepreg_bmi), 
+                       par = scale(parity_20)
+                     ),
+                   method = "REML")
+
+exploratory_mod_bw_sex_N251
+summary(exploratory_mod_bw_sex_N251)
+
+
+## set up plots
+par(mfrow = c(1, 2))
+
+gam.check(exploratory_mod_bw_sex_N251)
+
+plot(exploratory_mod_bw_sex_N251)
+
+## return plots
+par(mfrow = c(1, 1))
+```
+
+These results suggest that the relationship is nonlinear and is consistent with a change in slow/leveling off around the mean placental weight.
+
+## Association between placental weight and gene expression
+
+#### Main Sample, overall (N=253): Cubic Spline
+
+First, we will start with differential gene expression using the natural cubic spline. To integrate with our `limma`-`voom` pipeline, we need to use the `splines` package to generate the underlying basis functions (the `mgcv::gam` function was useful for estimating EDF, but is not compatible with the pipeline). We will use natural cubic splines with three internal knots (set at the 25th, 50th, and 75th percentiles of placental weight).
+
+```{r DEGanalysisSpline}
+covar_ratio$placenta_weight |> scale() |> summary()
+
+knots = c(-0.63579, -0.03189, 0.54786)
+
+mod_spline <- with(covar_ratio |> 
+                     dplyr::mutate(pw = scale(placenta_weight),
+                                   bmi = scale(h_m_prepreg_bmi),
+                                   age = scale(h_m_delivery_age),
+                                   par = scale(parity_20)
+                                   ), 
+                model.matrix(~ splines::ns(pw, knots=knots) + 
+                               h_c_sex + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               age + 
+                               bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               par +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_spline)
+
+v <- voom(Y_norm, mod_spline, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+Results_pw_spline_N253 <- topTable(fit, coef = c(2:5), number = dim(fit)[1], adjust.method = "BH") #Coefficent 2:5 represent the 4 underlying basis functions in a 3-knot natural cubic spline
+
+hist(Results_pw_spline_N253$P.Value, breaks = 20, main = "Placental weight (N=253) - Natural Cubic Spline")
+abline(h = 13072/20)
+
+table(Results_pw_spline_N253$adj.P.Val<0.05)
+```
+
+Results must be interpreted visually.
+First, get the data in the right format.
+
+```{r fig.width=8, fig.height=8}
+## tidy up data: placental weight partial residuals data for plots
+pw_pr_df <- covar_ratio |> 
+  dplyr::mutate(pw = scale(placenta_weight) |> as.vector(),
+                bmi = scale(h_m_prepreg_bmi) |> as.vector(),
+                age = scale(h_m_delivery_age) |> as.vector(),
+                par = scale(parity_20) |> as.vector()
+                ) 
+
+## limit to FDR significant
+sig_pw_ensembl <- rownames(Results_pw_spline_N253)[Results_pw_spline_N253$adj.P.Val<0.05]
+
+logcpm <- cpm(Y_norm, log = TRUE)
+logcpm <- logcpm[sig_pw_ensembl, ]
+
+logcpm_partial_residuals <- lapply(rownames(logcpm),
+  function(ENSEMBL) {
+    ## make gene expression object
+  gene_expression <- logcpm[ENSEMBL, ] |> as.vector()
+  
+  ## get gene name
+  gene_name <- annot[annot$ENSEMBL == ENSEMBL, ]$SYMBOL |> as.vector()
+  
+  ## get fits
+  pr_fit <- lm(gene_expression ~ 
+                 ## no placenta weight because these are PARTIAL residuals
+               h_c_sex + 
+               labor_collapsed + 
+               h_del_method + 
+               batch +
+               age + 
+               bmi + 
+               h_m_ethn + 
+               race_collapsed +
+               edu_collapsed +
+               smoking_composite +
+               par +
+               gdm + 
+               htn_pregnancy, 
+             data = pw_pr_df)
+  
+  tibble(
+    pathways_id = pw_pr_df$pathways_id, 
+    pw = pw_pr_df$pw,
+    placenta_weight = pw_pr_df$placenta_weight,
+    part_res = resid(pr_fit),
+    gene_symbol = gene_name,
+    ensembl_gene_id = ENSEMBL
+  )
+  }) |>
+  dplyr::bind_rows()
+
+## plot residuals and use geom_smooth to get fits + se from splines::ns
+pw_DEGs_figure <- ggplot(logcpm_partial_residuals) +
+  aes(x = placenta_weight, y = part_res) +
+  ## labels
+  xlab("Placenta Weight, g") +
+  ylab("log~2~(CPM) Expression") +
+  # ggtitle(gene_name) +
+  ## plot partial residuals points
+  geom_point(color = "gray", 
+             size = 0.3) +
+  geom_smooth(method = "lm", 
+              formula = y ~ splines::ns(x, knots=c(379, 454, 526)),
+              color = "royalblue", 
+              fill = "deepskyblue", 
+              se = TRUE, 
+              alpha = 0.3, 
+              linewidth =0.5) +
+  scale_x_continuous(n.breaks = 3) +
+  theme_minimal(base_size = 9) +
+  theme(axis.title = element_markdown()) +
+  facet_wrap(vars(gene_symbol), ncol = 8)
+
+pw_DEGs_figure
+```
+
+Also pull out the genes that are also associated with BW~adj~ for the panel figure. 
+
+```{r fig.width = 1.5, fig.height=4}
+logcpm_partial_residuals |> 
+  dplyr::filter(gene_symbol %in% c("CDC25A", "CDH3", "DTL", "EYA2", "EZH2", 
+                                   "ILDR1", "KIF23", "KIF24", "MCM10", "ORC1", 
+                                   "RNF43", "SLC29A2", "TPX2", "ZNRF3", "ZWINT")) |>
+  dplyr::mutate(
+    gene_symbol = factor(gene_symbol, 
+                         levels = (c("CDC25A", "CDH3", "DTL", "EYA2", "EZH2", 
+                                   "ILDR1", "KIF23", "KIF24", "MCM10", "ORC1", 
+                                   "RNF43", "SLC29A2", "TPX2", "ZNRF3", "ZWINT")))) |>
+    ggplot() +
+  aes(x = placenta_weight, y = part_res) +
+  ## labels
+  xlab("PW") +
+  ylab("log~2~(CPM) Expression") +
+  geom_smooth(method = "lm", 
+              formula = y ~ splines::ns(x, knots=c(379, 454, 526)),
+              color = "forestgreen", 
+              fill = "forestgreen", 
+              se = TRUE, 
+              alpha = 0.2, 
+              linewidth = 0.3) +
+  scale_y_continuous(n.breaks = 2, position = "right") +
+  scale_x_continuous(n.breaks = 3) +
+  theme_minimal(base_size = 9) +
+  theme(axis.title = element_markdown(), 
+        axis.title.x = element_markdown(size = 10),
+        strip.text.y.left = element_text(angle = 0),
+        axis.text.y = element_blank()) +
+  facet_wrap(vars(gene_symbol), 
+             ncol = 1,
+             strip.position = "left") 
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "pw_sparklines_for_overlapping_genes.pdf"),
+       width = 1.5, height = 4, units = "in")
+```
+
+#### Main Sample, overall (N=253): Linear (Sensitivity Analysis)
+
+We observed a non-linear association between placental weight and birthweight. 
+We speculate that as placental weight increases (up to a point), surface area for nutrient transport increases, leading to heavier birthweights. However, the placenta is a highly metabolic organ, so as it reaches greater sizes, it might act as a nutrient sink. It is possible that gene expression in the placenta might be non-linearly associated with placental weight (as in the previous analysis). However, we also want to consider if a simpler linear model is also useful in modeling these relationships.
+
+```{r DEGanalysisLinear}
+mod_linear <- with(covar_ratio |> 
+                     dplyr::mutate(pw = scale(placenta_weight),
+                                   bmi = scale(h_m_prepreg_bmi),
+                                   age = scale(h_m_delivery_age),
+                                   par = scale(parity_20)
+                                   ), 
+                model.matrix(~ pw + 
+                               h_c_sex + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               age + 
+                               bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               par +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_linear)
+
+v <- voom(Y_norm, mod_linear, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+Results_pw_linear_N253 <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH") 
+
+hist(Results_pw_linear_N253$P.Value, breaks = 20, 
+     main = "Placental weight (N=253) - Linear")
+abline(h = 13072/20)
+
+table(Results_pw_linear_N253$adj.P.Val<0.05)
+
+table(Results_pw_linear_N253$P.Value<0.05)
+prop.test(x = 260, n = 13072, p = 0.05, correct = FALSE)
+
+table(Results_pw_linear_N253$P.Value<0.01)
+prop.test(x = 46, n = 13072, p = 0.01, correct = FALSE)
+```
+
+The *P*-value distribution suggests that the linear model is mis-specified and supports the nonlinear approach. 
+
+#### Sensitivity Sample, overall (N=251): Cubic Spline
+
+It is possible that the high placental weight samples have leverage and are influencing the results here, as well. We will conduct this analysis without those samples. 
+
+First, pull the two samples out of the RNA-seq DGE list. 
+
+```{r}
+Y_N251 <- Y_norm[, covar_sens$pathways_id]
+
+assertthat::are_equal(colnames(Y_N251), covar_sens$pathways_id)
+```
+
+```{r DEGanalysisSplineN251}
+covar_sens$placenta_weight |> scale() |> summary()
+
+knots_N251 = c(-0.65368, -0.03624, 0.57481)
+
+mod_spline_N251 <- with(covar_sens |> 
+                     dplyr::mutate(pw = scale(placenta_weight),
+                                   bmi = scale(h_m_prepreg_bmi),
+                                   age = scale(h_m_delivery_age),
+                                   par = scale(parity_20)
+                                   ), 
+                model.matrix(~ splines::ns(pw, knots=knots_N251) + 
+                               h_c_sex + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               age + 
+                               bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               par +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_spline_N251)
+
+v <- voom(Y_N251, mod_spline_N251, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+Results_pw_spline_N251 <- topTable(fit, coef = c(2:5), number = dim(fit)[1], adjust.method = "BH") #Coefficent 2:5 represent the 4 underlying basis functions in a 3-knot natural cubic spline
+
+hist(Results_pw_spline_N251$P.Value, breaks = 20, main = "Placental weight (N=251) - Natural Cubic Spline")
+abline(h = 13072/20)
+
+table(Results_pw_spline_N251$adj.P.Val<0.05)
+```
+
+#### Sensitivity Sample, overall (N=251): Linear
+
+Without these two samples in this sensitivity analysis, it is possible that the relationship can now be modeled linearly. 
+
+```{r DEGanalysisLinearN251}
+mod_linear_N251 <- with(covar_sens |> 
+                     dplyr::mutate(pw = scale(placenta_weight),
+                                   bmi = scale(h_m_prepreg_bmi),
+                                   age = scale(h_m_delivery_age),
+                                   par = scale(parity_20)
+                                   ), 
+                model.matrix(~ pw + 
+                               h_c_sex + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               age + 
+                               bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               par +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_linear_N251)
+
+v <- voom(Y_N251, mod_linear_N251, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+Results_pw_linear_N251 <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH") 
+
+hist(Results_pw_linear_N251$P.Value, breaks = 20, 
+     main = "Placental weight (N=251) - Linear")
+abline(h = 13072/20)
+
+table(Results_pw_linear_N251$adj.P.Val<0.05)
+
+table(Results_pw_linear_N251$P.Value<0.05)
+prop.test(x = 452, n = 13072, p = 0.05, correct = FALSE)
+
+table(Results_pw_linear_N251$P.Value<0.01)
+prop.test(x = 85, n = 13072, p = 0.01, correct = FALSE)
+```
+
+Now that we have conducted these analyses, let's plot them together on the same scale for ease of comparison.
+
+```{r fig.width=6, fig.height=4}
+(sensitivity_supplementary_figure <- dplyr::bind_rows(
+  Results_pw_spline_N251 |> dplyr::mutate(sample = "Sensitivity (*N* = 251)", model = "Natural Cubic Spline"),
+  Results_pw_linear_N251 |> dplyr::mutate(sample = "Sensitivity (*N* = 251)", model = "Linear"),
+  Results_pw_spline_N253 |> dplyr::mutate(sample = "Main (*N* = 253)", model = "Natural Cubic Spline"),
+  Results_pw_linear_N253 |> dplyr::mutate(sample = "Main (*N* = 253)", model = "Linear")
+  ) |>
+    ## visualize
+    ggplot(aes(x = P.Value)) +
+    ## axes
+    xlab("*P*-value") +
+    ylab("Count") +
+    ## data
+    # geom_bar() +
+    # scale_x_binned(n.breaks = 20) +
+    geom_histogram(breaks = seq(0, 1, 0.025), color = "gray20", fill = "gray") +
+    geom_hline(yintercept = 13072/40, color = "tomato", linetype = "dashed") +
+    ## theme
+    theme_classic(base_size = 12) +
+    facet_grid(sample ~ model) +
+    theme(
+      axis.title.x = element_markdown(),
+      strip.text = element_markdown()
+    )
+)
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "supplementary_sensitivity_analysis_P_distributions.pdf"),
+       units = "in", width = 6, height = 4)
+```
+
+## Sex-specific association between placental weight and gene expression
+
+```{r DEGanalysisSplinesSex}
+mod_sex <- with(covar_ratio |> 
+                  dplyr::mutate(pw = scale(placenta_weight),
+                                bmi = scale(h_m_prepreg_bmi),
+                                age = scale(h_m_delivery_age),
+                                par = scale(parity_20)
+                                ),
+                model.matrix(~ h_c_sex/splines::ns(pw, knots=knots) + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               age + 
+                               bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               par +
+                               gdm + 
+                               htn_pregnancy 
+                             )
+                )
+
+colnames(mod_sex)
+
+v <- voom(Y_norm, mod_sex, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+#### MALES ########
+Results_pw_male <- topTable(fit, coef = c(19, 21, 23, 25), number = dim(fit)[1], adjust.method = "BH") 
+
+hist(Results_pw_male$P.Value, breaks = 20, main = "Spline for placental weight: Males")
+abline(h = 13072/20)
+
+table(Results_pw_male$adj.P.Val<0.05)
+
+#### FEMALES ########
+Results_pw_female <- topTable(fit, coef = c(20, 22, 24, 26), number = dim(fit)[1], adjust.method = "BH") 
+
+hist(Results_pw_female$P.Value, breaks = 20, main = "Spline for placental weight: Females")
+abline(h = 13072/20)
+
+table(Results_pw_female$adj.P.Val<0.05)
+```
+
+Interestingly, there are no DEGs associated with PW in males, but there are 154 DEGS (FDR<0.05) in females. 
+
+Now, we want to retain the spline results for the overall analysis, females, and males in the *N* = 253 sample using natural cubic splines. 
+
+```{r}
+rm(covar_sens, designMatrix, fit, logcpm, logcpm_partial_residuals, 
+   mod_linear, mod_linear_N251, mod_sex, mod_spline, mod_spline_N251,
+   pr, pr_N251, pw_pr_df, sm, sm_N251, sig_pw_ensembl, v, 
+   Results_pw_linear_N251, Results_pw_linear_N253, Results_pw_spline_N251, 
+   knots_N251, Y_N251)
+```
+
+## Association between BW:PW and gene expression
+
+Until now, we have focused on the placenta in this analysis. However, the primary interest in this analysis is actually about placental efficiency, which is traditional expressed as the ratio of birthweight to placental weight. 
+
+```{r}
+mod_ratio <- with(covar_ratio, 
+                model.matrix(~ fetal_placental_ratio + 
+                               h_c_sex + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               h_m_delivery_age + 
+                               h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               parity_20 +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_ratio)
+
+v <- voom(Y_norm, mod_ratio, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+Results_ratio <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH")
+
+hist(Results_ratio$P.Value, breaks = 20, main = "BW:PW Ratio")
+abline(h = 13072/20)
+
+table(Results_ratio$adj.P.Val<0.05) 
+
+Results_ratio$pct_change <- 100*(2^Results_ratio$logFC-1)
+```
+
+There are 9 genes associated with BW:PW ratio in covariate adjusted models (FDR<0.05).
+
+```{r}
+Results_ratio |>
+  dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+  dplyr::filter(adj.P.Val<0.05) |>
+  dplyr::relocate(genes, logFC, pct_change) |>
+  dplyr::select(-ensembl_gene_id) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+We are also interested in sex-specific differences in gene expression. 
+
+```{r}
+mod_ratio_sex <- with(covar_ratio, 
+                model.matrix(~ h_c_sex/fetal_placental_ratio + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               h_m_delivery_age + 
+                               h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               parity_20 +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_ratio_sex)
+
+v <- voom(Y_norm, mod_ratio_sex, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+### MALES
+Results_ratio_male <- topTable(fit, coef = 19, number = dim(fit)[1], adjust.method = "BH") 
+
+
+hist(Results_ratio_male$P.Value, breaks = 20, main = "Placental Efficiency: Males")
+abline(h = 13072/20)
+
+table(Results_ratio_male$adj.P.Val<0.05)
+
+Results_ratio_male$pct_change <- 100*(2^Results_ratio_male$logFC-1)
+
+### FEMALES
+Results_ratio_female <- topTable(fit, coef = 20, number = dim(fit)[1], adjust.method = "BH") 
+
+
+hist(Results_ratio_female$P.Value, breaks = 20, main = "Placental Efficiency: Females")
+abline(h = 13072/20)
+
+table(Results_ratio_female$adj.P.Val<0.05)
+
+Results_ratio_female$pct_change <- 100*(2^Results_ratio_female$logFC-1)
+```
+
+Interestingly, the BW:PW ratio is associated with 32 DEGs in males (see volcano plot below) and no DEGs in females. 
+This might be explained by the nonlinear association between placental weight and gene expression in females but not males.
+Notably the *P*-value distribution for females is not uniform as expected under the null.
+
+```{r}
+table(Results_ratio_female$P.Value<0.05)
+prop.test(x = 503, n = 13072, p = 0.05, correct = FALSE)
+
+table(Results_ratio_female$P.Value<0.01)
+prop.test(x = 69, n = 13072, p = 0.01, correct = FALSE)
+```
+
+There are significantly fewer low values than expected by chance. This could be an indication that the ratio is not 
+
+
+## Association between BW~adj~ and gene expression
+
+Placental efficiency can be measured as a ratio of birth weight to placental weight  or we can think about it conversationally as "how many grams of baby is supported by 1 gram of placenta tissue". Placental weight has a non-linear relationship with birth weight in this cohort. We should be able to get similar results in models with the same covariates, either regressing on BW:PW ratio or birth weight adjusted for placental weight (as a natural cubic spline), though we anticipate that by adjusting for placental weight in the model and accounting for the nonlinear association will improve precision.
+
+Birthweight is measured in grams, but we will estimate the association between each gene and a 100-g increase in birthweight. Individually, a single gram is just too small and a kilo is to large. Since "every ounce counts" for birth weight, 100 g seemed like a useful intermediate.
+
+```{r DEGanalysisBWadjOverall}
+mod_bw <- with(covar_ratio |>
+                 dplyr::mutate(bw = birthweight/100,
+                               pw = scale(placenta_weight)), 
+                model.matrix(~ bw + 
+                               splines::ns(pw, knots=knots) + ## at 25, 50, 70 percentile
+                               h_c_sex + 
+                               labor_collapsed + 
+                               h_del_method + 
+                               batch +
+                               h_m_delivery_age + 
+                               h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               parity_20 +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_bw)
+
+v <- voom(Y_norm, mod_bw, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+Results_bw <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH") 
+
+hist(Results_bw$P.Value, breaks = 20, main = "Birthweigth adjusted")
+abline(h = 13072/20)
+
+table(Results_bw$adj.P.Val<0.05)
+
+Results_bw$pct_change <- 100*(2^Results_bw$logFC-1)
+```
+
+There are 458 differentially expressed genes associated with birthweight after adjusting for the nonlinear term for placental weight. 
+
+We are also interested in the potential for sex to modify these associations. 
+
+```{r}
+mod_bw_sex <- with(covar_ratio |>
+                 dplyr::mutate(bw = birthweight/100,
+                               pw = scale(placenta_weight)), 
+                model.matrix(~ h_c_sex/bw + 
+                               splines::ns(pw, knots=knots) +
+                               labor_collapsed + 
+                               h_del_method +
+                               batch +
+                               h_m_delivery_age + 
+                               h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               smoking_composite + 
+                               parity_20 +
+                               gdm + 
+                               htn_pregnancy 
+                             ))
+
+colnames(mod_bw_sex)
+
+v <- voom(Y_norm, mod_bw_sex, plot = TRUE) 
+designMatrix <- v$design
+fit <- eBayes(lmFit(v, designMatrix))
+
+## Males
+Results_bw_male <- topTable(fit, coef = 23, number = dim(fit)[1], adjust.method = "BH") #Coefficent 23 is birthweight in males
+
+
+hist(Results_bw_male$P.Value, breaks = 20, main = "Birthweight: Males")
+abline(h = 13072/20)
+
+table(Results_bw_male$adj.P.Val<0.05)
+
+Results_bw_male$pct_change <- 100*(2^Results_bw_male$logFC-1)
+
+## Females
+Results_bw_female <- topTable(fit, coef = 24, number = dim(fit)[1], adjust.method = "BH") #Coefficent 24 is birthweight in females
+
+hist(Results_bw_female$P.Value, breaks = 20, main = "Birthweight: Females")
+abline(h = 13072/20)
+
+table(Results_bw_female$adj.P.Val<0.05)
+Results_bw_female$pct_change <- 100*(2^Results_bw_female$logFC-1)
+```
+
+Interestingly, there are 12 DEGs (FDR<0.05) associated with BW~adj~ in males and 1282 DEGs associated with BW~adj~ in females. 
+
+#### Volcano Plots
+
+Start with data
+
+```{r}
+HeatmapColors <- rev(RColorBrewer::brewer.pal(11, "RdBu")) #Blue is lower, Red is  Higher
+
+volcano_data <- dplyr::bind_rows(
+  Results_bw |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW~adj~", analysis = "Overall"),
+  Results_ratio |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW:PW", analysis = "Overall"),
+  
+  Results_bw_female |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW~adj~", analysis = "Females"),
+  Results_ratio_female |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW:PW", analysis = "Females"),
+  
+  Results_bw_male |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+     dplyr::mutate(outcome = "BW~adj~", analysis = "Males"),
+  Results_ratio_male |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW:PW", analysis = "Males")
+) |>
+  dplyr::mutate(
+    analysis = factor(analysis) |> relevel(ref = "Overall"),
+    outcome = factor(outcome), 
+    sig = dplyr::if_else(adj.P.Val<0.05, 1, 0) |> factor(),
+    direction = dplyr::if_else(logFC<0, "negative", "positive") |> factor(),
+    geneLabel = dplyr::if_else(sig == "1", genes, ""), 
+    pointColor = factor(dplyr::if_else(sig == "1", direction, "none"), levels = c("positive", "none", "negative")), 
+  ) 
+
+volcano_label_table <- volcano_data |>
+  dplyr::group_by(outcome, analysis, direction) |>
+  dplyr::arrange(P.Value) |>
+  dplyr::slice(1:5) |>
+  dplyr::ungroup()
+```
+
+Note that since the relationship between placental weight and gene expression is non-linear, a single estimate of effect size for the volcano plot (logFC/beta coefficient) is irrelevant because the effect size is dependent on the placental weight. 
+
+```{r fig.width=8, fig.height=5.6}
+volcano_data |> 
+  ggplot() +
+  aes(x = logFC, y = -log10(P.Value)) +
+  ## lines for pvalues
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey70") +
+  geom_hline(yintercept = -log10(0.05/13072), linetype = "dashed", color = "grey70") +
+  ## labels 
+  labs(y = "-log~10~(*P*)",
+       x = "Effect Estimate") +
+  geom_point(shape = 21, color = "#FFFFFF00", aes(fill = pointColor)) +
+  geom_text_repel(data = volcano_label_table,
+  size = 2.5, fontface = "bold.italic",
+                  aes(color = pointColor, label = genes), min.segment.length = 0) +
+  ## scales
+  scale_color_manual(values = c(HeatmapColors[10], "#FFFFFF00", HeatmapColors[2])) +
+  scale_fill_manual(values = c(HeatmapColors[8], "grey", HeatmapColors[4])) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "none",
+        ## blue = down, red = up, 
+        ## but can figure out from logFC
+        # strip.text.y = element_blank(),
+        axis.title = ggtext::element_markdown(),
+        strip.text = ggtext::element_markdown()) +
+    facet_grid(outcome ~ analysis)
+```
+
+For the manuscript, we focus on the overall analysis (sex as a covariate, NOT an effect modifier).
+
+```{r fig.width=3, fig.height=6}
+volcano_data |> 
+  dplyr::filter(analysis == "Overall") |>
+  ggplot() +
+  aes(x = logFC, y = -log10(P.Value)) +
+  ## lines for pvalues
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey70") +
+  geom_hline(yintercept = -log10(0.05/13072), linetype = "dashed", color = "grey70") +
+  ## labels 
+  labs(y = "-log~10~(*P*)",
+       x = "Effect Estimate") +
+  geom_point(shape = 21, color = "#FFFFFF00", aes(fill = pointColor)) +
+  geom_text_repel(data = volcano_label_table |> 
+  dplyr::filter(analysis == "Overall"),
+  size = 2.5, fontface = "bold.italic",
+                  aes(color = pointColor, label = genes), min.segment.length = 0) +
+  ## scales
+  scale_color_manual(values = c(HeatmapColors[10], "#FFFFFF00", HeatmapColors[2])) +
+  scale_fill_manual(values = c(HeatmapColors[8], "grey", HeatmapColors[4])) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "none",
+        ## blue = down, red = up, 
+        ## but can figure out from logFC
+        # strip.text.y = element_blank(),
+        axis.title = ggtext::element_markdown(),
+        strip.text = ggtext::element_markdown()) +
+  ggh4x::facet_wrap2(vars(outcome), 
+                    ncol = 1,
+                     scales = "free_x"
+                     )
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "BWadj_Ratio_overall_volcano_plot.pdf"),
+       width = 3, height = 6, units = "in")
+```
+
+In the supplement, we present the sex-specific results.
+
+```{r fig.width=6.5, fig.height=6}
+volcano_data |> 
+  dplyr::filter(analysis != "Overall") |>
+  ggplot() +
+  aes(x = logFC, y = -log10(P.Value)) +
+  ## lines for pvalues
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey70") +
+  geom_hline(yintercept = -log10(0.05/13072), linetype = "dashed", color = "grey70") +
+  ## labels 
+  labs(y = "-log~10~(*P*)",
+       x = "Effect Estimate") +
+  geom_point(shape = 21, color = "#FFFFFF00", aes(fill = pointColor)) +
+  geom_text_repel(data = volcano_label_table |> 
+  dplyr::filter(analysis != "Overall"),
+  size = 2.5, fontface = "bold.italic",
+                  aes(color = pointColor, label = genes), min.segment.length = 0) +
+  ## scales
+  scale_color_manual(values = c(HeatmapColors[10], "#FFFFFF00", HeatmapColors[2])) +
+  scale_fill_manual(values = c(HeatmapColors[8], "grey", HeatmapColors[4])) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "none",
+        ## blue = down, red = up, 
+        ## but can figure out from logFC
+        # strip.text.y = element_blank(),
+        axis.title = ggtext::element_markdown(),
+        strip.text = ggtext::element_markdown()) +
+  ggh4x::facet_grid2(rows = vars(analysis), 
+                     cols = vars(outcome), 
+                     scales = "free_x", 
+                     independent = "x"
+                     )
+ggsave(filename = here::here("Mariana", "Draft3", "output", "BWadj_Ratio_sex_specific_volcano_plot.pdf"),
+       width = 6.5, height = 6, units = "in")
+```
+
+### How concordant are BW~adj~ and BW:PW?
+
+These two measures of placental efficiency are correlated, but do they associate with changes in the same direction between analyses? 
+
+In the figure below, the higher adjusted P-value will be used to color the points, so only ~7 points should have significant maximal FDR values. 
+
+```{r}
+volcano_data |> 
+  dplyr::mutate(outcome = forcats::fct_recode(outcome, bw = "BW~adj~", ratio = "BW:PW")) |>
+  dplyr::filter(analysis == "Overall") |>
+  dplyr::select(outcome, ensembl_gene_id, genes, logFC, FDR=adj.P.Val) |>
+  tidyr::pivot_wider(id_cols = c("ensembl_gene_id", "genes"), 
+                     names_from = outcome, 
+                     values_from = c("logFC", "FDR")) |>
+  dplyr::mutate(scaled_bw_logFC = scale(logFC_bw),
+                scaled_ratio_logFC = scale(logFC_ratio),
+                max_FDR = dplyr::if_else(FDR_bw >= FDR_ratio, FDR_bw, FDR_ratio),
+                min_FDR = dplyr::if_else(FDR_bw <= FDR_ratio, FDR_bw, FDR_ratio)) |>
+  dplyr::arrange(desc(max_FDR)) |>
+  ggplot() +
+  aes(y = logFC_bw, x = logFC_ratio, color = -log10(max_FDR)) +
+  ## axes
+  xlab("BW:PW Effect Estimate") +
+  ylab("BW~adj~ Effect Estimate") +
+  ## quadrants
+  geom_hline(yintercept = 0, color = "gray40", linetype = "dotted") +
+  geom_vline(xintercept = 0, color = "gray40", linetype = "dotted") +
+  geom_point(size = 1.2) +
+  scale_color_gradientn(
+    colors = rev(scico::scico(n = 11, palette = "batlow")),
+    name = "-log~10~(FDR~max~)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.title = element_markdown(), 
+        legend.title = element_markdown())
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "birthweight_ratio_concordance_logFC.pdf"),
+       height = 4, width = 6, units = "in")
+```
+
+To annotate the plot, how many points are in each quadrant?
+
+```{r}
+with(volcano_data |> 
+       dplyr::mutate(
+         outcome = forcats::fct_recode(outcome, bw = "BW~adj~", ratio = "BW:PW")) |>
+       ## filter: only include the overall analysis
+       dplyr::filter(analysis == "Overall") |>
+       ## select and simplify
+       dplyr::select(outcome, ensembl_gene_id, logFC, FDR=adj.P.Val) |>
+       tidyr::pivot_wider(id_cols = ensembl_gene_id, 
+                          names_from = outcome, 
+                          values_from = c("logFC", "FDR")) |>
+       dplyr::mutate(
+         sign_bw = dplyr::if_else(logFC_bw<0, "neg", "pos"),
+         sign_ratio = dplyr::if_else(logFC_ratio<0, "neg", "pos")
+       ) , 
+     table(sign_bw, sign_ratio))
+
+with(volcano_data |> 
+       dplyr::mutate(
+         outcome = forcats::fct_recode(outcome, bw = "BW~adj~", ratio = "BW:PW")) |>
+       ## filter: only include the overall analysis
+       dplyr::filter(analysis == "Overall") |>
+       ## select and simplify
+       dplyr::select(outcome, ensembl_gene_id, logFC, FDR=adj.P.Val) |>
+       tidyr::pivot_wider(id_cols = ensembl_gene_id, 
+                          names_from = outcome, 
+                          values_from = c("logFC", "FDR")) |>
+       dplyr::mutate(
+         sign_bw = dplyr::if_else(logFC_bw<0, "neg", "pos"),
+         sign_ratio = dplyr::if_else(logFC_ratio<0, "neg", "pos")
+       ) , 
+     chisq.test(sign_bw, sign_ratio), correct = FALSE)
+```
+
+Thus, the two measures of placental efficiency have concordant associations with placental gene expression.
+
+Pull the concordant genes and the genes that are also associated with PW for the panel figure. 
+
+```{r fig.width = 3, fig.height = 5.6}
+overlapping_outcomes_genes <- dplyr::bind_rows(
+  Results_bw |> dplyr::mutate(analysis = "BW~adj~"),
+  Results_ratio |> dplyr::mutate(analysis = "BW:PW"),
+  Results_pw_spline_N253 |> dplyr::mutate(analysis = "PW") |> dplyr::select(!2:5)
+) |>
+  dplyr::select(genes, logFC, FDR = adj.P.Val, analysis) |>
+  dplyr::filter(FDR<0.05) |>
+  dplyr::filter(duplicated(genes) == TRUE) |>
+  dplyr::pull(genes) |>
+  as.vector() |> 
+  unique()
+
+dplyr::bind_rows(
+  Results_bw |> dplyr::mutate(analysis = "BW~adj~"),
+  Results_ratio |> dplyr::mutate(analysis = "BW:PW"),
+  Results_pw_spline_N253 |> dplyr::mutate(analysis = "PW") |> dplyr::select(!2:5)
+) |>
+  dplyr::select(genes, logFC, FDR = adj.P.Val, analysis) |>
+  dplyr::filter(FDR<0.05) |>
+  dplyr::filter(genes %in% overlapping_outcomes_genes) |>
+  dplyr::mutate(
+    genes = factor(genes, 
+                   levels = rev(c(
+                     ## Concordant between BWadj and BW:PW
+                     "AC129492.3", "ASB2", "CAMSAP3", "KIF26B", "NDRG2", "PRX", "TOP2A", 
+                     ## BWadj AND PW-associated genes
+                     "CDC25A", "CDH3", "DTL", "EYA2", "EZH2", "ILDR1", "KIF23", "KIF24",
+                     "MCM10", "ORC1", "RNF43", "SLC29A2", "TPX2", "ZNRF3", "ZWINT")))) |> 
+  dplyr::filter(analysis != "PW") |>
+  dplyr::select(!FDR) |>
+  ## want to force NAs
+  tidyr::pivot_wider(id_cols = genes, names_from = analysis, values_from = logFC) |>
+  tidyr::pivot_longer(cols = !genes, names_to = "analysis", values_to = "logFC") |>
+  ggplot(aes(x = analysis, y = genes, fill = logFC)) +
+  geom_tile(color = "gray30") +
+  xlab(NULL) +
+  ylab(NULL) +
+  scale_fill_gradient2(midpoint=0, low="#0092B3", mid="white", high="#F09062",
+                       name = "Effect Estimate", #n.breaks = 4, 
+                       na.value = "lightgray") +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "right",
+        legend.justification = c(0, 1),
+        axis.text.x = element_markdown(size = 10),
+        legend.title = element_markdown())  +
+  guides(fill = guide_colorbar(theme = theme(
+    legend.key.width  = unit(1, "lines"),
+    legend.key.height = unit(5, "lines")
+  )))
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "bw_ratio_panel_for_overlapping_genes.pdf"),
+       width = 3, height = 5.6)
+```
+
+#### Save Results
+
+Collate all results (including the placental weight results not included in the volcano plot data) 
+
+```{r}
+full_res <- dplyr::bind_rows(
+  ## overall
+  Results_bw |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BWadj", analysis = "Overall"),
+  Results_ratio |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW:PW", analysis = "Overall"),
+  Results_pw_spline_N253 |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    ## remove logFC for basis splines because not really interpretable
+    dplyr::select(!3:6) |>
+    dplyr::mutate(outcome = "PW", analysis = "Overall"),
+  
+  ## Female
+  Results_bw_female |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BWadj", analysis = "Females"),
+  Results_ratio_female |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW:PW", analysis = "Females"),
+  Results_pw_female |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    ## remove logFC for basis splines because not really interpretable
+    dplyr::select(!3:6) |>
+    dplyr::mutate(outcome = "PW", analysis = "Females"),
+  
+  ## Males
+  Results_bw_male |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+     dplyr::mutate(outcome = "BWadj", analysis = "Males"),
+  Results_ratio_male |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    dplyr::mutate(outcome = "BW:PW", analysis = "Males"),
+   Results_pw_male |> 
+    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
+    ## remove logFC for basis splines because not really interpretable
+    dplyr::select(!3:6) |>
+    dplyr::mutate(outcome = "PW", analysis = "Males"),
+) |>
+  dplyr::mutate(
+    analysis = factor(analysis) |> relevel(ref = "Overall"),
+    outcome = factor(outcome))  |>
+  dplyr::select(ensembl_gene_id, gene_symbol = genes, analysis, coefficient = logFC, FDR = adj.P.Val, outcome)
+```
+
+
+```{r}
+bw_overall_gene_chr <- as.character(Results_bw[Results_bw$adj.P.Val<0.05, ]$genes)
+pw_overall_gene_chr <- as.character(Results_pw_spline_N253[Results_pw_spline_N253$adj.P.Val<0.05, ]$genes)
+ratio_overall_gene_chr <- as.character(Results_ratio[Results_ratio$adj.P.Val<0.05, ]$genes)
+
+gene_order_overall <- c(
+  ## ratio list, first (N=2)
+  ratio_overall_gene_chr[!ratio_overall_gene_chr %in% c(bw_overall_gene_chr, pw_overall_gene_chr)],
+  ## ratio and BWadj (N=7)
+  ratio_overall_gene_chr[ratio_overall_gene_chr %in% bw_overall_gene_chr],
+  ## BWadj alone (N=436)
+  bw_overall_gene_chr[!bw_overall_gene_chr %in% c(ratio_overall_gene_chr, pw_overall_gene_chr)],
+  ## BWadj and PW (N=15)
+  bw_overall_gene_chr[bw_overall_gene_chr %in% pw_overall_gene_chr],
+  ## PW alone. Note no logFC values  (N=31)
+  pw_overall_gene_chr[!pw_overall_gene_chr %in% bw_overall_gene_chr]
+) |>
+  unique()
+
+length(gene_order_overall)
+
+supplementary_table_overall <- full_res |>
+  ## only the overall analysis and only significant results
+  dplyr::filter(analysis == "Overall" & FDR<0.05) |>
+  ## now, drop analysis column, it is only one value/provides no additional information
+  dplyr::select(-analysis) |>
+  ## make wide: each outcome gets a logFC and FDR column
+  tidyr::pivot_wider(id_cols = ensembl_gene_id:gene_symbol, 
+                     names_from = outcome, 
+                     values_from = coefficient:FDR, 
+                     names_vary = "slowest") |>
+  dplyr::mutate(gene_symbol = factor(gene_symbol, levels = gene_order_overall)) |>
+  dplyr::arrange(gene_symbol)
+
+#### Sex specific Results ####
+bw_male_gene_chr <- as.character(Results_bw_male[Results_bw_male$adj.P.Val<0.05, ]$genes)
+pw_male_gene_chr <- as.character(Results_pw_male[Results_pw_male$adj.P.Val<0.05, ]$genes)
+ratio_male_gene_chr <- as.character(Results_ratio_male[Results_ratio_male$adj.P.Val<0.05, ]$genes)
+
+bw_female_gene_chr <- as.character(Results_bw_female[Results_bw_female$adj.P.Val<0.05, ]$genes)
+pw_female_gene_chr <- as.character(Results_pw_female[Results_pw_female$adj.P.Val<0.05, ]$genes)
+ratio_female_gene_chr <- as.character(Results_ratio_female[Results_ratio_female$adj.P.Val<0.05, ]$genes)
+
+gene_order_sex_specific <- c(
+  ## note, must prefix with analysis because there are some genes that are DEGs
+  ## in both the male and female specific analyses
+  ## male bwadj only first (n=8)
+  paste0("Males_", bw_male_gene_chr[!bw_male_gene_chr %in% ratio_male_gene_chr]),
+  ## male BW adj and BW:PW (n=4)
+  paste0("Males_", bw_male_gene_chr[bw_male_gene_chr %in% ratio_male_gene_chr]), 
+  ## male BW:PW only (28)
+  paste0("Males_", ratio_male_gene_chr[!ratio_male_gene_chr %in% bw_male_gene_chr]),
+  
+  ## female BWadj first (N=1240)
+  paste0("Females_", bw_female_gene_chr[!bw_female_gene_chr %in% pw_female_gene_chr]),
+  ## female BWadj and PW (N = 42)
+  paste0("Females_", bw_female_gene_chr[bw_female_gene_chr %in% pw_female_gene_chr]),
+  ## female PW only (N=112)
+  paste0("Females_", pw_female_gene_chr[!pw_female_gene_chr %in% bw_female_gene_chr])
+)
+
+length(gene_order_sex_specific)
+
+supplementary_table_sex_specific <- full_res |>
+  ## get the male and female specific analyses and only significant results
+  dplyr::filter(analysis != "Overall" & FDR<0.05) |>
+  ## make wide: each outcome gets a logFC and FDR column, but not analysis (will order with male specific genes first)
+  tidyr::pivot_wider(id_cols = c(ensembl_gene_id:gene_symbol, analysis), 
+                     names_from = outcome, 
+                     values_from = coefficient:FDR, 
+                     names_vary = "slowest") |>
+  ## generate a unique identifier that can be used with gene_order_sex_specific
+  ## to arrange the rows
+  dplyr::mutate(analysis_gene = paste(analysis, gene_symbol, sep = "_") |>
+                  factor(levels = gene_order_sex_specific)) |>
+  dplyr::arrange(analysis_gene) |>
+  ## finally remove analysis_gene (it was just for ordering)
+  dplyr::select(-analysis_gene)
+```
+
+
+# WGCNA
+
+Start by loading the WGCNA
+
+```{r}
+## WGCNA objects using gene ENSEMBL
+load(here::here("Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_ensembl.RData"))
+
+## make a variable for just the module names
+moduleColorsFWPW <- moduleColors
+moduleNamesFWPW <- as.character(unique(moduleColorsFWPW))
+
+## make sure to name the module colors with gene symbols
+names(moduleColorsFWPW) <- rownames(geneModuleMembership)
+geneModuleMembershipFWPW <- geneModuleMembership
+
+## now, subset the WGCNA objects to only include the subjects in COVAR
+## and sort by order in covar dataset
+cqn_expr_transposeFWPW <- cqn_expr_transpose[covar_ratio$pathways_id, ]
+MEsFWPW <- MEs[covar_ratio$pathways_id, ]
+
+## now that everything is renamed
+## remove the "originals"
+rm(geneModuleMembership, MEs, cqn_expr_transpose, moduleColors)
+
+
+## check dimensions
+dim(covar_ratio)
+dim(MEsFWPW)
+dim(geneModuleMembershipFWPW)
+dim(cqn_expr_transposeFWPW)
+length(moduleColorsFWPW)
+length(annot$SYMBOL)
+
+## change length of annot
+annotFWPW <- annot[annot$ENSEMBL %in% colnames(cqn_expr_transposeFWPW), ]
+
+## check orders
+## genes
+assertthat::are_equal(names(moduleColorsFWPW), rownames(geneModuleMembershipFWPW))
+assertthat::are_equal(colnames(cqn_expr_transposeFWPW), rownames(geneModuleMembershipFWPW))
+assertthat::are_equal(as.character(annotFWPW$ENSEMBL), rownames(geneModuleMembershipFWPW))
+
+## samples
+assertthat::are_equal(as.character(covar_ratio$pathways_id), rownames(MEsFWPW))
+```
+
+## Associations Between PW and WGCNA Module expression
+
+Use a joint linear hypothesis test: 
+
+```{r}
+mod_spline_joint <- lapply(colnames(MEsFWPW), function(module_name) {
+  
+      temp <- cbind(module = MEsFWPW[, module_name], covar_ratio) |> 
+        dplyr::mutate(pw = scale(placenta_weight), 
+                      bmi = scale(h_m_prepreg_bmi),
+                      age = scale(h_m_delivery_age),
+                      par = scale(parity_20)
+                      )
+      
+     mod <- lm(scale(module) ~  h_c_sex + 
+                                 labor_collapsed +
+                                 h_del_method +
+                                 batch +
+                                 age + 
+                                 bmi + 
+                                 h_m_ethn + 
+                                 race_collapsed + 
+                                 edu_collapsed +
+                                 par +
+                                 smoking_composite +
+                                 gdm +
+                                 htn_pregnancy +  
+                                 splines::ns(pw, knots=knots), 
+                data = temp)
+      
+      res <- car::linearHypothesis(mod, c("splines::ns(pw, knots = knots)1 = 0", 
+                                          "splines::ns(pw, knots = knots)2 = 0", 
+                                          "splines::ns(pw, knots = knots)3 = 0", 
+                                          "splines::ns(pw, knots = knots)4 = 0")) 
+      
+      tibble(
+        module = module_name,
+        sum_sq = res$`Sum of Sq`[2],
+        joint_p = res$`Pr(>F)`[2]
+      )
+}) |>
+  dplyr::bind_rows()  |>
+  ## unassigned module should not be included in analysis
+  dplyr::filter(module != "MEgrey") |> 
+  ## cut the "ME" out of the module names
+  dplyr::mutate(module = substring(module, 3)) 
+
+mod_spline_joint |>
+  dplyr::filter(joint_p < 0.05) |>
+  dplyr::arrange(module) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+There are 4 modules that are associated with placental weight using natural cubic splines. 
+
+Now, visualize.
+
+```{r fig.width=8, fig.height=2.5}
+## get names
+pw_module_names <- mod_spline_joint |>
+  dplyr::filter(joint_p < 0.05) |>
+  dplyr::pull(module)
+
+
+pw_wgcna_figure <- lapply(pw_module_names,
+  function(i) {
+   ## get character vectors
+  mod_name <- i
+  ME_name <- paste0("ME", mod_name)
+  
+  ## build temp dataset
+  temp <- cbind(module = MEsFWPW[, ME_name], covar_ratio) |> 
+        dplyr::mutate(pw = scale(placenta_weight) |> as.vector(), 
+                      bmi = scale(h_m_prepreg_bmi) |> as.vector(),
+                      age = scale(h_m_delivery_age) |> as.vector(),
+                      par = scale(parity_20) |> as.vector(),
+                      )
+      
+        pr_fit <- lm(scale(module) ~  h_c_sex + 
+                                 labor_collapsed +
+                                 h_del_method +
+                                 batch +
+                                 age + 
+                                 bmi + 
+                                 h_m_ethn + 
+                                 race_collapsed + 
+                                 edu_collapsed +
+                                 par +
+                                 smoking_composite +
+                                 gdm +
+                                 htn_pregnancy, 
+                data = temp)
+  
+  tibble(
+    pathways_id = temp$pathways_id, 
+    pw = temp$pw,
+    placenta_weight = temp$placenta_weight,
+    part_res = resid(pr_fit),
+    module = mod_name
+  )
+  }) |>
+  dplyr::bind_rows() |>
+  ggplot() +
+  aes(x = placenta_weight, y = part_res) +
+    xlab("Placental Weight, g") +
+    ylab("WGCNA Module Expression") +
+    geom_point(color = "gray", 
+             size = 0.3) +
+  geom_smooth(method = "lm", 
+              formula = y ~ splines::ns(x, knots=c(379, 454, 526)),
+              aes(color = module, fill = module),
+              show.legend = FALSE) +
+  ## update colors since lightcyan and lightgreen are hard to read
+  scale_color_manual(values = c("blue", "turquoise", "seagreen3", "midnightblue")) +
+  scale_fill_manual(values = c("dodgerblue", "cyan", "seagreen1", "royalblue1")) +
+    theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(size=10)) +
+  facet_wrap(vars(module), ncol = 4)
+
+pw_wgcna_figure
+```
+
+Combine the PW associated DEGs from above for the supplementary panel figure showing the nonlinear associations between PW and gene expression and WGCNA module expression
+
+```{r, fig.width=8, fig.height=10}
+cowplot::plot_grid(pw_DEGs_figure, pw_wgcna_figure, 
+                   nrow = 2, 
+                   rel_heights = c(8, 2.5), 
+                   labels = "AUTO", 
+                   label_size = 12) 
+
+ggsave(filename = here::here("Mariana", "Draft3", "output", "placenta_weight_nonlinear_supplementary_figure.pdf"),
+       width = 8, height = 10, units = "in")
+```
+
+#### Associations between BW~adj~ and WGCNA Module Expression
+
+```{r}
+intmod_bw <- lapply(colnames(MEsFWPW), function(module) {
+  
+      temp <- cbind(module = MEsFWPW[, module], covar_ratio) |>
+        dplyr::mutate(bw = birthweight/100, 
+                      pw = scale(placenta_weight))
+      
+      mod <- lm(scale(module) ~  splines::ns(pw, knots=knots) +
+                                 h_c_sex + 
+                                 labor_collapsed +
+                                 h_del_method +
+                                 batch +
+                                 h_m_delivery_age + 
+                                 h_m_prepreg_bmi + 
+                                 h_m_ethn + 
+                                 race_collapsed + 
+                                 edu_collapsed +
+                                 parity_20 +
+                                 smoking_composite +
+                                 gdm +
+                                 htn_pregnancy +  
+                                 bw, 
+                data = temp)
+      
+      broom::tidy(lm(mod)) |>
+        dplyr::mutate(module = rep(module, length(coefficients(mod))))
+}) |>
+  dplyr::bind_rows(.id = "Module") |>
+  dplyr::filter(term == "bw") |>
+  dplyr::filter(module != "MEgrey") |> ## unassigned module should not be included in analysis
+  dplyr::mutate(module = substring(module, 3)) |>
+  dplyr::select(all_of(c("module", "estimate", "std.error", "statistic", "p.value"))) 
+
+intmod_bw |>
+  dplyr::filter(p.value < 0.05) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+#### Associations between BW:PW and WGCNA Module Expression
+
+```{r}
+intmod_ratio <- lapply(colnames(MEsFWPW), function(module) {
+  
+      temp <- cbind(module = MEsFWPW[, module], covar_ratio)
+      
+      mod <- lm(scale(module) ~  h_c_sex + 
+                                 labor_collapsed +
+                                 h_del_method +
+                                 batch +
+                                 h_m_delivery_age + 
+                                 h_m_prepreg_bmi + 
+                                 h_m_ethn + 
+                                 race_collapsed + 
+                                 edu_collapsed +
+                                 parity_20 +
+                                 smoking_composite +
+                                 gdm +
+                                 htn_pregnancy +  
+                                 fetal_placental_ratio, 
+                data = temp)
+      
+      broom::tidy(lm(mod)) |>
+        dplyr::mutate(module = rep(module, length(coefficients(mod))))
+}) |>
+  dplyr::bind_rows(.id = "Module") |>
+  dplyr::filter(term == "fetal_placental_ratio") |>
+  dplyr::filter(module != "MEgrey") |> ## unassigned module should not be included in analysis
+  dplyr::mutate(module = substring(module, 3)) |>
+  dplyr::select(all_of(c("module", "estimate", "std.error", "statistic", "p.value"))) 
+
+intmod_ratio |>
+  dplyr::filter(p.value < 0.05) |>
+  kable() |>
+  kableExtra::kable_styling()
+```
+
+Now, visualize the results together to see if they are concordant.
+
+```{r fig.width=4, fig.height=4}
+module_dat <- dplyr::bind_rows(intmod_ratio |> dplyr::mutate(analysis = "BW:PW"),
+                               intmod_bw |> dplyr::mutate(analysis = "BW~adj~")) |>
+  dplyr::mutate(analysis = factor(analysis)) |>
+  ## only significant, so no zeros to worry about for estimate
+  dplyr::mutate(direction = factor(dplyr::if_else(estimate < 0, "negative", "positive"), 
+                                   levels = c("positive", "negative")),
+                log10_p = -log10(p.value),
+                magnitude = abs(estimate)
+                ) |>
+  dplyr::filter(p.value < 0.05)
+
+module_colors <- c(blue = "blue", darkolivegreen = "darkolivegreen",
+                   darkorange = "darkorange", grey60 = "grey60", lightcyan = "cyan3", 
+                   orange = "orange", salmon = "salmon", sienna3 = "sienna3", 
+                   skyblue = "skyblue3", violet = "violet", white = "ivory3")
+
+module_plot_all <- ggplot(module_dat, aes(x = analysis, y = module, fill = estimate)) +
+  ## axes
+  xlab("") +
+  ylab("Module") +
+  ## what we are actually plotting
+  # geom_point(size = 5, color = "black") +
+  geom_point(aes(size = magnitude), shape = 21, stroke = 0.2, color = "black") +
+  scale_fill_gradient2(midpoint=0, low="#0092B3", mid="White", high="#F09062", 
+                        name = "Effect Estimate") +
+  scale_size_continuous(name = "Abs(Effect Estimate)") +
+  theme_bw() +
+  theme(legend.position = "right",
+        axis.text.y= element_text(color=module_colors, face="bold"),
+    text = element_text(size = 10),
+    axis.text.x = element_markdown(angle = 45, vjust = 1, hjust = 1)
+  ) 
+module_plot_all
+```

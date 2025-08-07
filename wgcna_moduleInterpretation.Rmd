@@ -1,0 +1,218 @@
+---
+title: "WGCNA Module Interpretation"
+author: "Mariana Parenti"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+## Aim
+
+To characterize the WGCNA modules by 
+
+(a) Identifying module hubgenes, or the member genes that are highly correlated with the module's eigengene
+(b) Identifying KEGG pathways whose genes are over-represented among a module's member genes
+
+#### Load libraries
+
+```{r}
+library(tidyverse)       ## tidy data framework, ggplot2, pipes
+library(here)            ## sets path nicely for markdown
+library(biomaRt)         ## interfaces with BioMart
+library(AnnotationHub)   ## link to central genomic and related resources
+library(kableExtra)      ## for functions to make nicer table outputs
+library(edgeR)           ## for kegga function
+```
+
+#### Load Data
+
+```{r}
+## WGCNA objects using gene SYMBOLS
+load(here::here("Resubmission_July2024/output/wgcna/GAPPS_wide_WGCNA_symbol.RData"))
+
+## make a variable for just the module names
+moduleNames <- as.character(unique(moduleColors))
+
+## make sure to name the module colors with gene symbols
+names(moduleColors) <- rownames(geneModuleMembership)
+
+## check dimensions
+dim(MEs)
+dim(geneModuleMembership)
+dim(cqn_expr_transpose)
+length(moduleColors)
+
+## check orders
+## genes
+assertthat::are_equal(names(moduleColors), rownames(geneModuleMembership))
+assertthat::are_equal(colnames(cqn_expr_transpose), rownames(geneModuleMembership))
+assertthat::are_equal(as.character(annot$SYMBOL), rownames(geneModuleMembership))
+```
+
+#### Generate table of gene module memberships
+
+```{r}
+tibble(SYMBOL = names(moduleColors), 
+       Module = moduleColors) # %>%
+  # write_csv(file = here::here("Resubmission_July2024/output/wgcna/allGenesModuleMembership.csv"))
+```
+
+
+#### Print Hub Genes
+
+```{r}
+## Print Hub Genes
+for (i in 1:length(moduleNames)) {
+  ## setup
+  module <- moduleNames[i]
+  moduleGenes <- moduleColors == module;
+  
+  ## print module name
+  print("##############################")
+  print(module)
+  print("##############################")
+  ## select hubs
+  
+  geneModuleMembership %>%
+    rename_all(~ stringr::str_replace(., regex("^MM", ignore_case = TRUE), "")) %>%
+    as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "SYMBOL")) %>%
+    dplyr::mutate(moduleGenes = moduleGenes) %>%
+    dplyr::filter(moduleGenes == TRUE) %>%
+    dplyr::select(all_of(c("SYMBOL", module))) %>%
+    dplyr::mutate(abs = abs(get(module))) %>%
+    dplyr::filter(abs > 0.8) %>%
+    dplyr::arrange(SYMBOL) %>%
+    dplyr::pull(SYMBOL) %>%
+    print()
+  
+}
+
+## all associations (not just hub genes)
+## confirm that orders are the same
+assertthat::are_equal(geneModuleMembership %>% rename_all(~ stringr::str_replace(., regex("^MM", ignore_case = TRUE), "")) %>% as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "SYMBOL")) %>% dplyr::pull(SYMBOL), names(moduleColors))
+
+geneModuleMembership %>%
+  ## make sure the column names match moduleColors
+  rename_all(~ stringr::str_replace(., regex("^MM", ignore_case = TRUE), "")) %>%
+  ## get gene name into a column  
+  as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "SYMBOL")) %>%
+  ## make a row for the home module
+  dplyr::mutate(home_module = moduleColors) %>%
+  ## pivot longer so that we have a line for each module-gene correlation
+  tidyr::pivot_longer(cols = 2:40, names_to = "module", values_to = "corr") %>%
+  ## now, filter so that only the correlation with the home_module is retained
+  dplyr::filter(home_module == module) %>%
+  dplyr::arrange(module, dplyr::desc(abs(corr))) %>%
+  dplyr::select(all_of(c("SYMBOL", "module", "corr"))) # %>%
+  # readr::write_csv(here::here("Resubmission_July2024/output/wgcna/module_hubGenes/allModule_geneCorrelations.csv"))
+
+```
+
+Note that the `*_hubGenes.csv` files are each just a list of gene symbols that are highly correlated with the eigengene. The file `allModule_geneCorrelation.csv` includes the correlation (`corr`) between each gene (`SYMBOL`) and its assigned home module (`module`).
+
+## Gene Set Enrichment for Modules of Interest
+
+#### Prepare KEGG Database
+
+- Adapted from SYLs code
+- Removed human disease pathways by consulting the most updated version of KEGG: https://www.genome.jp/kegg/pathway.html
+
+```{r}
+## start by generating the KEGG pathways map
+keggs <- getGeneKEGGLinks()
+
+kegglst <- split(keggs$GeneID, keggs$PathwayID)
+
+keggmapper <- read.table("http://rest.kegg.jp/list/pathway/hsa/", sep = "\t", quote = "\"", fill = TRUE, comment.char = "")
+keggmapper[,2] <- sapply(strsplit(keggmapper[,2], " - "), function(x) gsub(" ", "_", paste(x[-length(x)], collapse = " ")))
+
+## remove prefix
+names(kegglst)<-gsub("path:","", names(kegglst))
+
+## then remove Human Disease Pathways
+## Note: Get rid of 1, the superpathway "Metabolic pathways"
+keggmapper<-keggmapper[2:263,]
+
+# Map to pathways
+kegglst<-kegglst[keggmapper$V1]
+names(kegglst)<-keggmapper$V2
+```
+
+## Get Entrez IDs
+
+```{r}
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+annot_entrez <- biomaRt::getBM(filters= "ensembl_gene_id", attributes=c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id"), values=annot$ENSEMBL, mart=mart)
+
+#Note: want different attributes? -use "listAttributes()" to see  what is  available
+#Pathway enrichment with KEGG  requires entrez IDs
+# Ensembl ids are more stable
+
+## remove duplicates
+annot_entrez <- na.omit(annot_entrez)
+annot_entrez <- annot_entrez [!duplicated(annot_entrez$ensembl_gene_id), ]
+annot_entrez <- annot_entrez [!duplicated(annot_entrez$entrezgene_id), ]
+
+rownames(annot_entrez) <- as.character(annot_entrez$ensembl_gene_id)
+x <- intersect(annot$ENSEMBL, rownames(annot_entrez))
+annot_entrez <- annot_entrez[x,]
+```
+
+Now, make the full list.
+
+```{r}
+## need to make a limited version of the pathways to include as background
+limited_pathways <- keggs %>%
+  dplyr::filter(PathwayID %in% keggmapper$V1)  
+
+all_enriched_pathways <- lapply(moduleNames, function(module) {
+  moduleGenes <- moduleColors == module
+  
+  ## select module genes as moduleGeneSet
+  moduleGeneSet <- geneModuleMembership %>%
+    rename_all(~ stringr::str_replace(., regex("^MM", ignore_case = TRUE), "")) %>%
+    as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "SYMBOL")) %>%
+    dplyr::mutate(moduleGenes = moduleGenes) %>%
+    dplyr::filter(moduleGenes == TRUE) %>%
+    dplyr::select(all_of(c("SYMBOL", module))) %>%
+    dplyr::inner_join(annot_entrez, by = c("SYMBOL" = "hgnc_symbol"))
+  
+  ## test if the module geneset 
+  mod_enriched <- limma::kegga(moduleGeneSet$entrezgene_id, 
+                         species = "Hs",
+                         universe = annot_entrez$entrezgene_id,
+                         gene.pathway = limited_pathways,
+                         pathway.names = keggmapper,
+                         FDR = 0.05,
+                         restrict.universe = TRUE)
+  mod_enriched$FDR <- p.adjust(mod_enriched$P.DE, method = "BH")
+  
+  mod_enriched %>%
+    dplyr::mutate(module = rep(module, length(mod_enriched$Pathway)))
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::filter(module != "grey") ## recall: this is the unsorted module
+
+# write_csv(all_enriched_pathways, file = "/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/output/wgcna/module_pathways/allPathwaysEnrichmentResults.csv")
+```
+
+Finally, visualize the over-representation/enrichment results (FDR<0.2).
+
+```{r, fig.height=12, fig.width=9}
+pathdata <- all_enriched_pathways %>%
+  dplyr::filter(FDR < 0.2)
+
+pathdata <- pathdata %>%
+  within({
+    magnitude <- -log10(P.DE)
+    })
+
+ggplot(pathdata, aes(x = factor(module), y = Pathway, size = magnitude, fill = module)) +
+  geom_point(shape = 21, color = "black") +
+  ylab("") +
+  xlab("") +
+  scale_fill_manual(values = sort(unique(pathdata$module))) +
+  theme_bw() +
+  theme(text = element_text(size = 11), 
+        legend.position = "none",
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
