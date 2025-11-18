@@ -1,20 +1,22 @@
 ---
 title: "Phthalates, BW, and BW:PW"
 author: "Alison Paquette & Samantha Lapehn"
-date: "05/08/25"
+date: "09/25/25"
 output: html_document
 editor_options: 
   chunk_output_type: console
 ---
 
 ### GAPPS: Phthalates, BW, BW:PW Project
-Here we are performing analysis to identify associations between phthalates, BW and BW:PW ratio in the GAPPS cohort. Separately, we have identified placental transcriptomic signature of these exposures/outcomes and performed a mediation analysis for overlapping signatures. 
+Here we are performing analysis to identify associations between phthalates, BW and BW:PW ratio in the GAPPS cohort. Separately, we have identified placental transcriptomic signature of these exposures/outcomes and performed a mediation analysis for overlapping signatures. This updated version scales the BW and BW:PW data to make their scales more comparable in plotting.
 
 #### Load Packages
 ```{r load packages}
 library(tidyverse)
 library(patchwork)
 ```
+
+Adding DEHP data 05/08/25. 
 
 
 #### Load Data
@@ -63,7 +65,7 @@ PHT_Filtered <- PHT %>%
 
 sum(rownames(PHT_Filtered)==covar_final_filtered$pathways_id)
 
-#Remove participant g1200711 since they have an NA for hypertensive disorder and were excluded from other placental efficiency analyses
+#Remove participant g1200711 since they have an NA for hypertensive disorder and were excluded from Mariana's analysis
 
 covar_final_filtered <- covar_final_filtered %>%
   dplyr::filter(!pathways_id %in% c("g1200711"))
@@ -76,7 +78,6 @@ sum(rownames(PHT_Filtered)==covar_final_filtered$pathways_id)
 
 ### Scale Placental Weight and Calculate Summary Statistics
 Summary statistics are needed to set the spline knots
-
 ```{r scale PW}
 #unscaled PW
 summary(covar_final_filtered$m_pl1_weight)
@@ -87,13 +88,19 @@ summary(covar_final_filtered$scaled_PW)
 knots <- c(-0.60980, 0.00497, 0.53831)
 ```
 
+### Scale the Variables to Match other BW:PW and BWadj plots
+```{r scale vars}
+covar_final_filtered$bw_scaled <- scale(covar_final_filtered$h_birthweight_g)
+covar_final_filtered$BWPW_scaled <- scale(covar_final_filtered$fetal_placental_ratio)
+```
+
 ### Linear Regression Models-BW
 ```{r BW Models}
 PHT_BW<-data.frame(matrix(NA,nrow=16,ncol=4))
 
 for(i in 1:16){
 PDat<-PHT_Filtered[,i]
-BWModel<-lm(covar_final_filtered$h_birthweight_g~PDat+
+BWModel<-lm(covar_final_filtered$bw_scaled~PDat+
               covar_final_filtered$h_c_sex + 
               covar_final_filtered$h_m_delivery_age + 
               covar_final_filtered$race_collapsed + 
@@ -137,13 +144,14 @@ PHT_BW$Chemical <- factor(PHT_BW$Chemical, levels = sort(unique(PHT_BW$Chemical)
 PHT_BW$p_group <- factor(PHT_BW$p_group, levels = c("< 0.05", "0.05 - 0.1", "≥ 0.1"))
 ```
 
+
 ### Linear Regression Models-BW:PW
 ```{r BW:PW Model}
 PHT_BW_PW<-data.frame(matrix(NA,nrow=16,ncol=4))
 
 for(i in 1:16){
 PDat<-PHT_Filtered[,i]
-BWPWModel<-lm(covar_final_filtered$fetal_placental_ratio~PDat+
+BWPWModel<-lm(covar_final_filtered$BWPW_scaled~PDat+
                 covar_final_filtered$h_c_sex + 
                 covar_final_filtered$h_m_delivery_age + 
                 covar_final_filtered$race_collapsed + 
@@ -202,9 +210,9 @@ BWplot <- ggplot(PHT_BW, aes(x = Estimate, y = Chemical)) +
     name = "p-value"
   ) +
   labs(
-    title =expression("Birthweight"["adj"]*" (g)"),
+    title =expression("Birthweight"["adj"]*""),
     x = "Beta Coefficient (95% CI)",
-    y = "Phthalate Metabolite"
+    y = "Phthalates"
   ) +
   theme(
     plot.title = element_text(hjust = 0.5, size = 12),
@@ -227,7 +235,7 @@ BWPWplot <- ggplot(PHT_BW_PW, aes(x = Estimate, y = Chemical)) +
   labs(
     title = "Birthweight:Placental Weight",
     x = "Beta Coefficient (95% CI)",
-    y = "Phthalate Metabolite"
+    y = "Phthalates"
   ) +
   theme(
     plot.title = element_text(hjust = 0.5, size = 12),

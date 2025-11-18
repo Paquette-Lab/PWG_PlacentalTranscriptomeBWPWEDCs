@@ -1,0 +1,131 @@
+---
+title: "GAPPS: Placental Gene Expression and Phthalate Exposures"
+author: "Mariana Parenti and Sam Lapehn"
+date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+## Trimester 1- Phthalates RNAseq
+
+Running the phthalate analysis using only samples collected in the 1st trimester. 
+
+
+### Load Libraries
+
+```{r load packages}
+library(tidyverse)
+library(here)
+library(assertthat)
+library(edgeR)
+library(RColorBrewer)
+library(kableExtra) 
+library(RUVSeq) 
+library(ggrepel)
+library(biomaRt)
+library(org.Hs.eg.db)
+```
+
+#### Load Data
+
+```{r load data}
+## Filterd and Normalized RNAseq
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_FilteredNormalizedRNAseq_N49_062725.RData")
+
+## Filtered and Natural Log Transformed Phthalate Data
+PHT <-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_NaturalLogPhthalates_N49_062725.csv")
+rownames(PHT) <- PHT$X
+PHT <- PHT %>%
+  dplyr::select(-X)
+
+## Filtered covariates
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_Covariates_N49_062725.RData")
+covars <- covar_complete_T1
+covars <- data.frame(covars)
+rownames(covars) <- covars$pathways_id
+
+sum(rownames(PHT) == rownames(covars))
+#Fix Order
+PHT <- PHT[rownames(covars), ]
+sum(rownames(PHT) == rownames(covars))
+
+#Combine Covar + Phthalates
+covar_PHT <- merge(covars, PHT, by='row.names')
+
+#Check order
+rownames(covar_PHT) <- covar_PHT$Row.names
+covar_PHT <- covar_PHT %>%
+  dplyr::select(-Row.names)
+sum(rownames(covar_PHT) == colnames(Y_norm_T1$counts))
+
+#Check variable types
+summary(covar_PHT)
+
+covar_PHT$race_collapsed <- factor(covar_PHT$race_collapsed, levels=c("White", "Other"))
+covar_PHT$batch <- factor(covar_PHT$batch, levels=c("1", "2", "3"))
+
+summary(covar_PHT)
+
+```
+
+### Differential Gene Expression Analysis
+
+```{r DEGanalysis}
+all_PHT_results <- lapply(colnames(PHT)[1:16], function(phthalate) {
+    ## first, build mod using get function
+  mod <- with(covar_PHT, 
+              model.matrix(~ get(phthalate) + 
+                             h_c_sex + 
+                               labor_collapsed +
+                               h_del_method +
+                               h_m_delivery_age + 
+                              h_m_prepreg_bmi + 
+                               h_m_ethn + 
+                               race_collapsed + 
+                               edu_collapsed +
+                               parity_20 + 
+                              sg + 
+                             smoking_composite + 
+                             batch
+                             ))
+  
+  ## now, limma-voom
+  v <- voom(Y_norm_T1, mod, plot = TRUE)  
+  designMatrix <- v$design
+  fit <- eBayes(lmFit(v, designMatrix))
+
+  ## get results (remember, we want coef 2) and turn into a tibble
+  res_PHT <- topTable(fit, coef = 2, number = dim(fit)[1], adjust.method = "BH") %>%
+    as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_id")) %>%
+    dplyr::mutate(Phthalate = phthalate) %>%
+    dplyr::relocate(Phthalate)
+  
+  }) %>%
+  dplyr::bind_rows() 
+
+lapply(colnames(PHT)[1:16], function(phthalate) {
+  temp <- all_PHT_results %>%
+    dplyr::filter(Phthalate == phthalate)
+  
+  tibble(Phthalate = phthalate, 
+         `FDR<0.05` = sum(temp$adj.P.Val<0.05),
+         `FDR<0.10` = sum(temp$adj.P.Val<0.1),
+         `FDR<0.20` = sum(temp$adj.P.Val<0.2),
+         `P<0.005` =  sum(temp$P.Value<0.005))
+  }) %>%
+  dplyr::bind_rows() %>%
+  kable() %>%
+  kableExtra::kable_styling()
+```
+
+### Make Phthalate DEG Table
+```{r phthalate dEG table}
+#Filter for signficant data
+sig_PHT_results <- all_PHT_results %>%
+  dplyr::filter(adj.P.Val<0.05)
+unique(sig_PHT_results$Phthalate)
+#Export to reformat as DEG table
+#write.csv(all_PHT_results,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/Phthalate_AllResults_T1_SplitVisits_N49_071025.csv")
+```

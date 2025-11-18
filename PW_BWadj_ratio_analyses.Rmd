@@ -5,6 +5,8 @@ date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
 output: html_document
 ---
 
+20251015 - Updates to improve visualizations: scale both placental efficiency measures. 
+
 ## Aims
 
 (a) Clean data for placental efficiency and placental gene expression analyses
@@ -359,6 +361,17 @@ summary(supp_tab1)
 rm(batches, Cotinine)
 ```
 
+## Scale variables
+
+```{r}
+covar_ratio <- covar_ratio |>
+  dplyr::mutate(
+    bw_scale = scale(birthweight) |> as.vector(),
+    ratio_scale = scale(fetal_placental_ratio) |> as.vector()
+  )
+```
+
+
 ## RNA-seq Data Cleaning
 
 Start by removing the duplicated sample and the NovoSeq results from the samples that were run on both instruments, using length scaled TPM values.
@@ -632,7 +645,7 @@ ggpubr::ggarrange(unadj_nonlinear_plot,
                   common.legend = TRUE, 
                   legend = "bottom")
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "BW_PW_ratio_spline_figure.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "BW_PW_ratio_spline_figure.pdf"),
        width = 6.5, height = 4, units = "in")
 ```
 
@@ -784,7 +797,7 @@ ggpubr::ggarrange(unadj_nonlinear_plot + xlim(100, 1000),
                   common.legend = TRUE, 
                   legend = "right")
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "BW_PW_ratio_spline_figure_N253_N251.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "BW_PW_ratio_spline_figure_N253_N251.pdf"),
        width = 6.5, height = 2.5, units = "in")
 ```
 
@@ -957,45 +970,6 @@ pw_DEGs_figure <- ggplot(logcpm_partial_residuals) +
   facet_wrap(vars(gene_symbol), ncol = 8)
 
 pw_DEGs_figure
-```
-
-Also pull out the genes that are also associated with BW~adj~ for the panel figure. 
-
-```{r fig.width = 1.5, fig.height=4}
-logcpm_partial_residuals |> 
-  dplyr::filter(gene_symbol %in% c("CDC25A", "CDH3", "DTL", "EYA2", "EZH2", 
-                                   "ILDR1", "KIF23", "KIF24", "MCM10", "ORC1", 
-                                   "RNF43", "SLC29A2", "TPX2", "ZNRF3", "ZWINT")) |>
-  dplyr::mutate(
-    gene_symbol = factor(gene_symbol, 
-                         levels = (c("CDC25A", "CDH3", "DTL", "EYA2", "EZH2", 
-                                   "ILDR1", "KIF23", "KIF24", "MCM10", "ORC1", 
-                                   "RNF43", "SLC29A2", "TPX2", "ZNRF3", "ZWINT")))) |>
-    ggplot() +
-  aes(x = placenta_weight, y = part_res) +
-  ## labels
-  xlab("PW") +
-  ylab("log~2~(CPM) Expression") +
-  geom_smooth(method = "lm", 
-              formula = y ~ splines::ns(x, knots=c(379, 454, 526)),
-              color = "forestgreen", 
-              fill = "forestgreen", 
-              se = TRUE, 
-              alpha = 0.2, 
-              linewidth = 0.3) +
-  scale_y_continuous(n.breaks = 2, position = "right") +
-  scale_x_continuous(n.breaks = 3) +
-  theme_minimal(base_size = 9) +
-  theme(axis.title = element_markdown(), 
-        axis.title.x = element_markdown(size = 10),
-        strip.text.y.left = element_text(angle = 0),
-        axis.text.y = element_blank()) +
-  facet_wrap(vars(gene_symbol), 
-             ncol = 1,
-             strip.position = "left") 
-
-ggsave(filename = here::here("Mariana", "Draft3", "output", "pw_sparklines_for_overlapping_genes.pdf"),
-       width = 1.5, height = 4, units = "in")
 ```
 
 #### Main Sample, overall (N=253): Linear (Sensitivity Analysis)
@@ -1178,7 +1152,7 @@ Now that we have conducted these analyses, let's plot them together on the same 
     )
 )
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "supplementary_sensitivity_analysis_P_distributions.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "supplementary_sensitivity_analysis_P_distributions.pdf"),
        units = "in", width = 6, height = 4)
 ```
 
@@ -1248,7 +1222,7 @@ Until now, we have focused on the placenta in this analysis. However, the primar
 
 ```{r}
 mod_ratio <- with(covar_ratio, 
-                model.matrix(~ fetal_placental_ratio + 
+                model.matrix(~ ratio_scale + 
                                h_c_sex + 
                                labor_collapsed + 
                                h_del_method + 
@@ -1276,17 +1250,15 @@ hist(Results_ratio$P.Value, breaks = 20, main = "BW:PW Ratio")
 abline(h = 13072/20)
 
 table(Results_ratio$adj.P.Val<0.05) 
-
-Results_ratio$pct_change <- 100*(2^Results_ratio$logFC-1)
 ```
 
-There are 9 genes associated with BW:PW ratio in covariate adjusted models (FDR<0.05).
+There are 9 genes associated with a 1-SD change in BW:PW ratio in covariate adjusted models (FDR<0.05).
 
 ```{r}
 Results_ratio |>
   dplyr::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
   dplyr::filter(adj.P.Val<0.05) |>
-  dplyr::relocate(genes, logFC, pct_change) |>
+  dplyr::relocate(genes, logFC) |>
   dplyr::select(-ensembl_gene_id) |>
   kable() |>
   kableExtra::kable_styling()
@@ -1296,7 +1268,7 @@ We are also interested in sex-specific differences in gene expression.
 
 ```{r}
 mod_ratio_sex <- with(covar_ratio, 
-                model.matrix(~ h_c_sex/fetal_placental_ratio + 
+                model.matrix(~ h_c_sex/ratio_scale + 
                                labor_collapsed + 
                                h_del_method + 
                                batch +
@@ -1326,8 +1298,6 @@ abline(h = 13072/20)
 
 table(Results_ratio_male$adj.P.Val<0.05)
 
-Results_ratio_male$pct_change <- 100*(2^Results_ratio_male$logFC-1)
-
 ### FEMALES
 Results_ratio_female <- topTable(fit, coef = 20, number = dim(fit)[1], adjust.method = "BH") 
 
@@ -1336,8 +1306,6 @@ hist(Results_ratio_female$P.Value, breaks = 20, main = "Placental Efficiency: Fe
 abline(h = 13072/20)
 
 table(Results_ratio_female$adj.P.Val<0.05)
-
-Results_ratio_female$pct_change <- 100*(2^Results_ratio_female$logFC-1)
 ```
 
 Interestingly, the BW:PW ratio is associated with 32 DEGs in males (see volcano plot below) and no DEGs in females. 
@@ -1359,13 +1327,10 @@ There are significantly fewer low values than expected by chance. This could be 
 
 Placental efficiency can be measured as a ratio of birth weight to placental weight  or we can think about it conversationally as "how many grams of baby is supported by 1 gram of placenta tissue". Placental weight has a non-linear relationship with birth weight in this cohort. We should be able to get similar results in models with the same covariates, either regressing on BW:PW ratio or birth weight adjusted for placental weight (as a natural cubic spline), though we anticipate that by adjusting for placental weight in the model and accounting for the nonlinear association will improve precision.
 
-Birthweight is measured in grams, but we will estimate the association between each gene and a 100-g increase in birthweight. Individually, a single gram is just too small and a kilo is to large. Since "every ounce counts" for birth weight, 100 g seemed like a useful intermediate.
-
 ```{r DEGanalysisBWadjOverall}
 mod_bw <- with(covar_ratio |>
-                 dplyr::mutate(bw = birthweight/100,
-                               pw = scale(placenta_weight)), 
-                model.matrix(~ bw + 
+                 dplyr::mutate(pw = scale(placenta_weight)), 
+                model.matrix(~ bw_scale + 
                                splines::ns(pw, knots=knots) + ## at 25, 50, 70 percentile
                                h_c_sex + 
                                labor_collapsed + 
@@ -1394,8 +1359,6 @@ hist(Results_bw$P.Value, breaks = 20, main = "Birthweigth adjusted")
 abline(h = 13072/20)
 
 table(Results_bw$adj.P.Val<0.05)
-
-Results_bw$pct_change <- 100*(2^Results_bw$logFC-1)
 ```
 
 There are 458 differentially expressed genes associated with birthweight after adjusting for the nonlinear term for placental weight. 
@@ -1404,9 +1367,8 @@ We are also interested in the potential for sex to modify these associations.
 
 ```{r}
 mod_bw_sex <- with(covar_ratio |>
-                 dplyr::mutate(bw = birthweight/100,
-                               pw = scale(placenta_weight)), 
-                model.matrix(~ h_c_sex/bw + 
+                 dplyr::mutate(pw = scale(placenta_weight)), 
+                model.matrix(~ h_c_sex/bw_scale + 
                                splines::ns(pw, knots=knots) +
                                labor_collapsed + 
                                h_del_method +
@@ -1432,21 +1394,18 @@ fit <- eBayes(lmFit(v, designMatrix))
 Results_bw_male <- topTable(fit, coef = 23, number = dim(fit)[1], adjust.method = "BH") #Coefficent 23 is birthweight in males
 
 
-hist(Results_bw_male$P.Value, breaks = 20, main = "Birthweight: Males")
+hist(Results_bw_male$P.Value, breaks = 20, main = "Birthweight adjusted: Males")
 abline(h = 13072/20)
 
 table(Results_bw_male$adj.P.Val<0.05)
 
-Results_bw_male$pct_change <- 100*(2^Results_bw_male$logFC-1)
-
 ## Females
 Results_bw_female <- topTable(fit, coef = 24, number = dim(fit)[1], adjust.method = "BH") #Coefficent 24 is birthweight in females
 
-hist(Results_bw_female$P.Value, breaks = 20, main = "Birthweight: Females")
+hist(Results_bw_female$P.Value, breaks = 20, main = "Birthweight adjusted: Females")
 abline(h = 13072/20)
 
 table(Results_bw_female$adj.P.Val<0.05)
-Results_bw_female$pct_change <- 100*(2^Results_bw_female$logFC-1)
 ```
 
 Interestingly, there are 12 DEGs (FDR<0.05) associated with BW~adj~ in males and 1282 DEGs associated with BW~adj~ in females. 
@@ -1529,7 +1488,7 @@ volcano_data |>
 For the manuscript, we focus on the overall analysis (sex as a covariate, NOT an effect modifier).
 
 ```{r fig.width=3, fig.height=6}
-volcano_data |> 
+overall_volcano_plots <- volcano_data |> 
   dplyr::filter(analysis == "Overall") |>
   ggplot() +
   aes(x = logFC, y = -log10(P.Value)) +
@@ -1555,12 +1514,11 @@ volcano_data |>
         # strip.text.y = element_blank(),
         axis.title = ggtext::element_markdown(),
         strip.text = ggtext::element_markdown()) +
-  ggh4x::facet_wrap2(vars(outcome), 
-                    ncol = 1,
-                     scales = "free_x"
-                     )
+  facet_wrap(vars(outcome), ncol = 1)
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "BWadj_Ratio_overall_volcano_plot.pdf"),
+overall_volcano_plots
+
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "BWadj_Ratio_overall_volcano_plot.pdf"),
        width = 3, height = 6, units = "in")
 ```
 
@@ -1593,12 +1551,10 @@ volcano_data |>
         # strip.text.y = element_blank(),
         axis.title = ggtext::element_markdown(),
         strip.text = ggtext::element_markdown()) +
-  ggh4x::facet_grid2(rows = vars(analysis), 
-                     cols = vars(outcome), 
-                     scales = "free_x", 
-                     independent = "x"
-                     )
-ggsave(filename = here::here("Mariana", "Draft3", "output", "BWadj_Ratio_sex_specific_volcano_plot.pdf"),
+  facet_grid(rows = vars(analysis), 
+             cols = vars(outcome)
+             )
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "BWadj_Ratio_sex_specific_volcano_plot.pdf"),
        width = 6.5, height = 6, units = "in")
 ```
 
@@ -1637,7 +1593,7 @@ volcano_data |>
   theme(axis.title = element_markdown(), 
         legend.title = element_markdown())
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "birthweight_ratio_concordance_logFC.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "birthweight_ratio_concordance_logFC.pdf"),
        height = 4, width = 6, units = "in")
 ```
 
@@ -1681,11 +1637,10 @@ Thus, the two measures of placental efficiency have concordant associations with
 
 Pull the concordant genes and the genes that are also associated with PW for the panel figure. 
 
-```{r fig.width = 3, fig.height = 5.6}
+```{r fig.width = 3, fig.height = 6}
 overlapping_outcomes_genes <- dplyr::bind_rows(
   Results_bw |> dplyr::mutate(analysis = "BW~adj~"),
-  Results_ratio |> dplyr::mutate(analysis = "BW:PW"),
-  Results_pw_spline_N253 |> dplyr::mutate(analysis = "PW") |> dplyr::select(!2:5)
+  Results_ratio |> dplyr::mutate(analysis = "BW:PW")
 ) |>
   dplyr::select(genes, logFC, FDR = adj.P.Val, analysis) |>
   dplyr::filter(FDR<0.05) |>
@@ -1694,23 +1649,15 @@ overlapping_outcomes_genes <- dplyr::bind_rows(
   as.vector() |> 
   unique()
 
-dplyr::bind_rows(
+overlapping_genes_plot <- dplyr::bind_rows(
   Results_bw |> dplyr::mutate(analysis = "BW~adj~"),
-  Results_ratio |> dplyr::mutate(analysis = "BW:PW"),
-  Results_pw_spline_N253 |> dplyr::mutate(analysis = "PW") |> dplyr::select(!2:5)
+  Results_ratio |> dplyr::mutate(analysis = "BW:PW")
 ) |>
   dplyr::select(genes, logFC, FDR = adj.P.Val, analysis) |>
   dplyr::filter(FDR<0.05) |>
   dplyr::filter(genes %in% overlapping_outcomes_genes) |>
   dplyr::mutate(
-    genes = factor(genes, 
-                   levels = rev(c(
-                     ## Concordant between BWadj and BW:PW
-                     "AC129492.3", "ASB2", "CAMSAP3", "KIF26B", "NDRG2", "PRX", "TOP2A", 
-                     ## BWadj AND PW-associated genes
-                     "CDC25A", "CDH3", "DTL", "EYA2", "EZH2", "ILDR1", "KIF23", "KIF24",
-                     "MCM10", "ORC1", "RNF43", "SLC29A2", "TPX2", "ZNRF3", "ZWINT")))) |> 
-  dplyr::filter(analysis != "PW") |>
+    genes = factor(genes)) |> 
   dplyr::select(!FDR) |>
   ## want to force NAs
   tidyr::pivot_wider(id_cols = genes, names_from = analysis, values_from = logFC) |>
@@ -1732,8 +1679,15 @@ dplyr::bind_rows(
     legend.key.height = unit(5, "lines")
   )))
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "bw_ratio_panel_for_overlapping_genes.pdf"),
-       width = 3, height = 5.6)
+cowplot::plot_grid(overall_volcano_plots, 
+                   overlapping_genes_plot,
+                   labels = "AUTO",
+                   label_size = 10,
+                   ncol = 1, 
+                   rel_heights = c(2, 1))
+
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "figure2_PANEL.pdf"),
+       width = 3, height = 9)
 ```
 
 #### Save Results
@@ -1868,6 +1822,14 @@ supplementary_table_sex_specific <- full_res |>
   dplyr::select(-analysis_gene)
 ```
 
+
+```{r}
+write_csv(full_res, file = here::here("Mariana", "Env Int Revision", "output", "full_BW_PW_ratio_results.csv"))
+
+write_csv(supplementary_table_overall, file = here::here("Mariana", "Env Int Revision", "output", "supplementary_table_placental_overall_S7.csv"))
+
+write_csv(supplementary_table_sex_specific, file = here::here("Mariana", "Env Int Revision", "output", "supplementary_table_placental_sex_specific_S8.csv"))
+```
 
 # WGCNA
 
@@ -2048,7 +2010,7 @@ cowplot::plot_grid(pw_DEGs_figure, pw_wgcna_figure,
                    labels = "AUTO", 
                    label_size = 12) 
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "placenta_weight_nonlinear_supplementary_figure.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "placenta_weight_nonlinear_supplementary_figure.pdf"),
        width = 8, height = 10, units = "in")
 ```
 
@@ -2058,8 +2020,7 @@ ggsave(filename = here::here("Mariana", "Draft3", "output", "placenta_weight_non
 intmod_bw <- lapply(colnames(MEsFWPW), function(module) {
   
       temp <- cbind(module = MEsFWPW[, module], covar_ratio) |>
-        dplyr::mutate(bw = birthweight/100, 
-                      pw = scale(placenta_weight))
+        dplyr::mutate(pw = scale(placenta_weight))
       
       mod <- lm(scale(module) ~  splines::ns(pw, knots=knots) +
                                  h_c_sex + 
@@ -2075,14 +2036,14 @@ intmod_bw <- lapply(colnames(MEsFWPW), function(module) {
                                  smoking_composite +
                                  gdm +
                                  htn_pregnancy +  
-                                 bw, 
+                                 bw_scale, 
                 data = temp)
       
       broom::tidy(lm(mod)) |>
         dplyr::mutate(module = rep(module, length(coefficients(mod))))
 }) |>
   dplyr::bind_rows(.id = "Module") |>
-  dplyr::filter(term == "bw") |>
+  dplyr::filter(term == "bw_scale") |>
   dplyr::filter(module != "MEgrey") |> ## unassigned module should not be included in analysis
   dplyr::mutate(module = substring(module, 3)) |>
   dplyr::select(all_of(c("module", "estimate", "std.error", "statistic", "p.value"))) 
@@ -2113,14 +2074,14 @@ intmod_ratio <- lapply(colnames(MEsFWPW), function(module) {
                                  smoking_composite +
                                  gdm +
                                  htn_pregnancy +  
-                                 fetal_placental_ratio, 
+                                 ratio_scale, 
                 data = temp)
       
       broom::tidy(lm(mod)) |>
         dplyr::mutate(module = rep(module, length(coefficients(mod))))
 }) |>
   dplyr::bind_rows(.id = "Module") |>
-  dplyr::filter(term == "fetal_placental_ratio") |>
+  dplyr::filter(term == "ratio_scale") |>
   dplyr::filter(module != "MEgrey") |> ## unassigned module should not be included in analysis
   dplyr::mutate(module = substring(module, 3)) |>
   dplyr::select(all_of(c("module", "estimate", "std.error", "statistic", "p.value"))) 
@@ -2159,7 +2120,7 @@ module_plot_all <- ggplot(module_dat, aes(x = analysis, y = module, fill = estim
   geom_point(aes(size = magnitude), shape = 21, stroke = 0.2, color = "black") +
   scale_fill_gradient2(midpoint=0, low="#0092B3", mid="White", high="#F09062", 
                         name = "Effect Estimate") +
-  scale_size_continuous(name = "Abs(Effect Estimate)") +
+  scale_size_area(name = "Abs(Effect Estimate)") +
   theme_bw() +
   theme(legend.position = "right",
         axis.text.y= element_text(color=module_colors, face="bold"),
@@ -2168,3 +2129,13 @@ module_plot_all <- ggplot(module_dat, aes(x = analysis, y = module, fill = estim
   ) 
 module_plot_all
 ```
+
+Write full results for downstream analysis/figures 
+
+```{r}
+dplyr::bind_rows(
+  intmod_ratio |> dplyr::mutate(analysis = "BW:PW"),
+  intmod_bw |> dplyr::mutate(analysis = "BW~adj~")) |>
+  write_csv(here::here("Mariana", "Env Int Revision", "output", "WGCNA_bw_ratio_fullResults.csv"))
+```
+

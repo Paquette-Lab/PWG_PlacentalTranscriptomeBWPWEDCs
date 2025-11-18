@@ -5,6 +5,8 @@ date: "Current Version: `r format(Sys.time(), '%d %B %Y')`"
 output: html_document
 ---
 
+Update: Normalize birthweight and ratio to 1-SD
+
 ## Aims
 
 (a) Clean data for mediation analyses
@@ -270,8 +272,8 @@ te_table <- lapply(exposures, function(phthalate) {
     droplevels() |>
     ## now center and vectorize because glm doesn't like the attributes
     dplyr::mutate(
-      #ratio = scale(fetal_placental_ratio) |> as.vector(),
-      #birthweight = scale(birthweight) |> as.vector(),
+      ratio_scale = scale(fetal_placental_ratio) |> as.vector(),
+      bw_scale = scale(birthweight) |> as.vector(),
       pw = scale(placenta_weight) |> as.vector(),
       h_m_prepreg_bmi = scale(h_m_prepreg_bmi) |> as.vector(),
       h_m_delivery_age = scale(h_m_delivery_age) |> as.vector(),
@@ -281,7 +283,7 @@ te_table <- lapply(exposures, function(phthalate) {
   
   x <- covar_ratio[, phthalate] |> unlist() 
   
-  mod <- lm(birthweight ~ 
+  mod <- lm(bw_scale ~ 
               splines::ns(pw, knots=knots) + 
               h_c_sex + 
               h_m_delivery_age + 
@@ -322,8 +324,8 @@ te_ratio_table <- lapply(exposures, function(phthalate) {
     droplevels() |>
     ## now center and vectorize because glm doesn't like the attributes
     dplyr::mutate(
-      #ratio = scale(fetal_placental_ratio) |> as.vector(),
-      #birthweight = scale(birthweight) |> as.vector(),
+      ratio_scale = scale(fetal_placental_ratio) |> as.vector(),
+      bw_scale = scale(birthweight) |> as.vector(),
       pw = scale(placenta_weight) |> as.vector(),
       h_m_prepreg_bmi = scale(h_m_prepreg_bmi) |> as.vector(),
       h_m_delivery_age = scale(h_m_delivery_age) |> as.vector(),
@@ -333,7 +335,7 @@ te_ratio_table <- lapply(exposures, function(phthalate) {
   
   x <- covar_ratio[, phthalate] |> unlist() 
   
-  mod <- lm(fetal_placental_ratio ~ h_c_sex + labor_collapsed + 
+  mod <- lm(ratio_scale ~ h_c_sex + labor_collapsed + 
               h_del_method +smoking_composite + h_m_delivery_age + 
               h_m_prepreg_bmi + h_m_ethn + race_collapsed +  edu_collapsed + 
               parity_20 + SG + x,
@@ -412,7 +414,9 @@ covariates <- covar_ratio |>
   droplevels() |>
   ## now center and vectorize because glm doesn't like the attributes
   dplyr::mutate(
-    placenta_weight = scale(placenta_weight) |> as.vector(),
+    ratio_scale = scale(fetal_placental_ratio) |> as.vector(), 
+    bw_scale = scale(birthweight) |> as.vector(),
+    pw_scale = scale(placenta_weight) |> as.vector(),
     h_m_prepreg_bmi = scale(h_m_prepreg_bmi) |> as.vector(),
     h_m_delivery_age = scale(h_m_delivery_age) |> as.vector(),
     parity_20 = scale(parity_20) |> as.vector(),
@@ -426,12 +430,12 @@ exposure <- covar_ratio |>
 
 ## scaled centered mediators, M
 ## remove unassigned module
-M_scaled <- MEsFWPW |> 
+M_scaled <- MEsFWPW[, !colnames(MEsFWPW) %in% c("MEgrey")] |> 
   scale()
 
 ## covariates (not include HTN/GDM because on pathway?)
 cov_mat <- with(covariates, model.matrix(
-  ~ splines::ns(placenta_weight, knots=knots) +
+  ~ splines::ns(pw_scale, knots=knots) +
     h_c_sex + 
     labor_collapsed +
     h_del_method +
@@ -457,7 +461,7 @@ hima_res_bw <- lapply(exposures, function(phthalate) {
   eHIMA.fit <- hima_efficient(
     X = exposure[, phthalate] |> as.vector(),
     M = M_scaled,
-    Y = covariates$birthweight |> as.vector(),
+    Y = covariates$bw_scale |> as.vector(),
     COV = cov_mat,
     scale = FALSE,
     FDRcut = 0.05,
@@ -489,20 +493,16 @@ hima_res_bw |>
   kableExtra::collapse_rows(target = 1)
 ```
 
-Combine with total effect
+Format for paper
 
 ```{r}
 hima_res_bw |>
   dplyr::bind_rows() |>
-  dplyr::full_join(te_table |>
-                     dplyr::select(exposure, TE = estimate, TE_p = p.value), 
-                   by = join_by(exposure)) |>
-  dplyr::mutate(proportion_mediated = 100*(IDE/TE) |> round(3),
-                exposure = stringr::str_to_upper(exposure),
+  dplyr::mutate(exposure = stringr::str_to_upper(exposure),
                 Index = substring(Index, 3)) |>
   dplyr::arrange(exposure, Index) |>
-  dplyr::filter(TE_p<0.1) |>
-  dplyr::select(exposure, Index, alpha_hat, beta_hat, IDE, proportion_mediated, pmax) |>
+  dplyr::select(exposure, Index, alpha_hat, beta_hat, IDE, rimp, pmax) |>
+  dplyr::filter(pmax<0.05) |>
   kable() |>
   kableExtra::kable_styling() |>
   kableExtra::collapse_rows(target = 1)
@@ -538,7 +538,7 @@ hima_res_ratio <- lapply(exposures, function(phthalate) {
   eHIMA.fit <- hima_efficient(
     X = exposure[, phthalate] |> unlist(),
     M = M_scaled,
-    Y = covariates$fetal_placental_ratio |> unlist(),
+    Y = covariates$ratio_scale,
     COV = cov_mat_ratio,
     scale = FALSE,
     FDRcut = 0.05,
@@ -562,21 +562,18 @@ hima_res_ratio |>
   kableExtra::collapse_rows(target = 1)
 ```
 
-Combine with total effect
+Print for results
 
 ```{r}
 hima_res_ratio |>
   dplyr::bind_rows() |>
-  dplyr::full_join(te_ratio_table |>
-                     dplyr::select(exposure, TE = estimate, TE_p = p.value), 
-                   by = join_by(exposure)) |>
-  dplyr::mutate(proportion_mediated = 100*(IDE/TE) |> round(3),
-                exposure = stringr::str_to_upper(exposure),
+  dplyr::mutate(exposure = stringr::str_to_upper(exposure),
                 Index = substring(Index, 3)) |>
   dplyr::arrange(exposure, Index) |>
-  dplyr::filter(TE_p<0.1) |>
-  dplyr::select(exposure, Index, alpha_hat, beta_hat, IDE, proportion_mediated, pmax) |>
+  dplyr::filter(pmax<0.05) |>
+  dplyr::select(exposure, Index, alpha_hat, beta_hat, IDE, rimp, pmax) |>
   kable() |>
   kableExtra::kable_styling() |>
   kableExtra::collapse_rows(target = 1)
 ```
+

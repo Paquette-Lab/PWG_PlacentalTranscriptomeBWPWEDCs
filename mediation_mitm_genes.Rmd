@@ -27,36 +27,85 @@ library(ggtext)
 Get meet-in-the-middle gene pairs first
 
 ```{r}
-Dat <- readr::read_csv(here::here("Mariana/Draft3/CIRCOS_and_MITMmediation/circos_MITM_sigResults_20250710.csv")) |>
-  ## remove unneeded columns
-  dplyr::select(-c("Sector", "Track_Sublevel")) |>
-  ## filter to only include significant results
-  dplyr::filter(FDR<0.05) |>
-  dplyr::filter(Track_Analysis == "Overall") |>
-  ## arrange by sector (chemical class) and metabolite
-  dplyr::arrange(SECTOR, Metabolite, Track_Analysis) |> 
-  ## convert sector to factor 
-  dplyr::mutate(
-    Sector = factor(SECTOR, levels = c("PW", "BWadj", "BW:PW", "Phthalate"))
-  ) |>
-  ## assign unique x_position within each sector based on metabolite order
-  dplyr::mutate(
-    x_position = ave(seq_along(Metabolite), Sector, FUN = seq_along),
-    logFC = dplyr::if_else(Sector == "PW", 0, logFC)
-  ) 
+##### full phthalate results
+phthalate_all <- readr::read_csv(here::here("Mariana/Draft3/CIRCOS_and_MITMmediation/Phthalate_DEGs_GeoMean_071025.csv")) |>
+  dplyr::select(-1)
 
+##### fetal outcomes results 
+all_outcome <- readr::read_csv(file = here::here("Mariana", "Env Int Revision", "output", "full_BW_PW_ratio_results.csv"))
+
+## Wrangle data
+
+dat <- dplyr::bind_rows(
+  all_outcome |>
+    dplyr::filter(analysis == "Overall" & FDR<0.05) |>
+    dplyr::select(genes = gene_symbol, 
+                  logFC = coefficient,
+                  FDR,
+                  variable = outcome) |>
+    dplyr::mutate(type = "outcome"),
+  phthalate_all |>
+    dplyr::select(genes, 
+                  logFC,
+                  FDR = adj.P.Val, 
+                  variable = Phthalate) |>
+    dplyr::mutate(type = "exposure")
+  )
+
+## first pull out meet in the middle genes
+## color in the MEET IN THE MIDDLE results
 shared_genes <- intersect(
-  Dat$genes[Dat$Sector == "Phthalate"],
-  Dat$genes[Dat$Sector %in% c("BWadj", "BW:PW", "PW")]
+  dat$genes[dat$type == "exposure"],
+  dat$genes[dat$type == "outcome"]
 )
 
-Dat |>
+dat |>
   dplyr::filter(genes %in% shared_genes) |>
-  dplyr::arrange(genes, Sector) |>
-  dplyr::select(genes, logFC, FDR, Sector, Metabolite) |>
+  dplyr::arrange(genes, type) |>
+  dplyr::select(genes, logFC, FDR, variable) |>
   kable() |>
   kableExtra::kable_styling()
 ```
+
+```{r}
+library(pheatmap)
+
+mitm_for_heatmap <- dat |>
+  dplyr::filter(genes %in% shared_genes) |>
+  dplyr::select(genes, variable, logFC) |>
+  tidyr::pivot_wider(id_cols = genes, names_from = variable, values_from = logFC)
+
+## need matrix
+MITM_forHeatmap <- matrix(data = with(mitm_for_heatmap, c(BWadj, MCINP)),
+                          ncol = 2,
+                          byrow = FALSE, 
+                          dimnames = list(
+                            c(mitm_for_heatmap$genes),
+                            c("BW(adj)", "MCINP")
+                          ))
+
+pheatmap(t(MITM_forHeatmap),
+         color = colorRampPalette(c("#0092B3", "White","#F09062"))(31),
+         scale='none',# unscaled data
+         na.color="lightgray",
+         cluster_rows =F,
+         cluster_cols=F,
+         na_col="lightgray",
+         cellwidth=20, #Change tehe for size
+         cellheight=20, #change these for size
+         gaps_row = c(2),
+         treeheight_row = 0,
+         fontsize_col = 15, 
+         fontsize_row=15,
+         fontsize=15,
+         #annotation_row = annotation,
+         #annotation_colors =annotation_colors,
+         display_numbers = F, 
+         breaks = seq(-.3, .3, length.out = 31))
+
+
+```
+
 
 Load the data
 
@@ -228,7 +277,7 @@ covar_rnaseq <- within(covar_rnaseq, {
   h_del_method <- factor(h_del_method, labels = c("Vaginal", "C-section"))
   gdm <- factor(gdm, labels = c("No", "Yes"))
   htn_pregnancy <- factor(htn_pregnancy, labels = c("No", "Yes"))
-  batch <- factor(batch) ## batch 4 is largest, but no
+  batch <- factor(batch) ## batch 4 is largest, but no samples with phthalates measured
   })
 ```
 
@@ -241,13 +290,16 @@ covar_ratio <- covar_rnaseq |>
                 parity_20, htn_pregnancy, gdm, labor_collapsed, h_del_method,
                 fetal_placental_ratio, placenta_weight, birthweight,
                 ## extras for table1
-                h_birth_gestage, h_m_race, h_m_enroll_educ) %>%
+                h_birth_gestage, h_m_race, h_m_enroll_educ) |>
   tidyr::drop_na(any_of(c("batch", "h_c_sex", "h_m_delivery_age", "smoking_composite",
                 "race_collapsed", "h_m_ethn", "edu_collapsed", "h_m_prepreg_bmi", 
                 "parity_20", "htn_pregnancy", "gdm", "labor_collapsed", 
                 "h_del_method", "fetal_placental_ratio"))) |>
   dplyr::inner_join(PHTH, by = join_by(pathways_id)) |>
-  droplevels()
+  droplevels() |>
+  dplyr::mutate(
+    bw_scale = scale(birthweight) |> as.vector()
+  )
 
 dim(covar_ratio)
 ```
@@ -469,7 +521,7 @@ covariates <- covar_ratio |>
 
 ## covariates 
 cov_mat <- with(covariates, model.matrix(
-  ~ birthweight +
+  ~ bw_scale +
     splines::ns(pw, knots=knots) +
     h_c_sex + 
     labor_collapsed +
@@ -529,7 +581,7 @@ mediation_res <- mclapply(1:length(ensembl_genes), function(i) {
                 phthalate,
               cov_mat)
   
-  fit.Y <- lm(birthweight ~  
+  fit.Y <- lm(bw_scale ~  
                 `splines::ns(pw, knots = knots)1` + 
                 `splines::ns(pw, knots = knots)2` + 
                 `splines::ns(pw, knots = knots)3` + 
@@ -558,7 +610,7 @@ mediation_res <- mclapply(1:length(ensembl_genes), function(i) {
   mediation_mod <- mediate(fit.M, fit.Y, 
                            treat = 'phthalate', 
                            mediator = 'gene_logcpm',
-                           outcome = 'birthweight',
+                           outcome = 'bw_scale',
                            boot = TRUE,
                            sims = 10000)
   
@@ -575,71 +627,9 @@ mediation_res <- mclapply(1:length(ensembl_genes), function(i) {
   dplyr::bind_rows()
 ```
 
-## Visualize the mediation results
-
-Horizontal layout with total and direct effects.
-
-```{r fig.width=4.5, fig.height=3}
-all_mitm_plt <- mediation_res |>
-  ## data wrangling
-  dplyr::filter(term %in% c("Total Effect", "ACME", "ADE")) |>
-  ## Rename labels for plot
-  dplyr::mutate(effect_name = dplyr::case_match(
-    term, 
-    "Total Effect" ~ "TE",
-    "ACME" ~ "CME",
-    "ADE" ~ "DE"
-    )) |>
-  ## make variables for if the results are significant
-  dplyr::mutate(sig = dplyr::if_else(`p-value`<0.05, TRUE, FALSE)) |>
-  ## make significance stars
-  dplyr::mutate(stars = dplyr::if_else(sig == TRUE, "*", "")) |>
-  #### VIZUALIZE 
-  ggplot() +
-  ## add vertical line at ZERO: if lines cross, confidence interval includes 0
-  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
-  ## data: plot segment for 95% CI, point for point estimate, text for significance stars
-  geom_segment(aes(x = `95% CI Lower`, 
-                   xend = `95% CI Upper`, 
-                   y = effect_name, 
-                   yend = effect_name, 
-                   color = sig)) +
-  geom_point(aes(x = Estimate, 
-                 y = effect_name, 
-                 color = sig)) +
-  geom_text(aes(x = `95% CI Lower` - 15, ## plot stars off to the left
-                y = effect_name, 
-                label = stars, 
-                color = sig), 
-            size = 6) +
-  ## scale formatting
-  scale_color_manual(values = c("black", "tomato"), 
-                     name = "P < 0.05", 
-                     guide = "none") + 
-  scale_x_continuous(breaks = c(-100, 0, 100)) +
-  xlab("Effect Estimate, g") + 
-  ylab(NULL) +
-  theme_classic(base_size = 10) +
-  facet_wrap(vars(pair), ncol = 3) +
-  theme(
-      strip.text = element_text(face = "bold.italic"),
-      strip.background = element_rect(fill="transparent"),
-      panel.background = element_rect(fill='transparent'), #transparent panel bg
-      plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
-      panel.grid.major = element_blank(), #remove major gridlines
-      panel.grid.minor = element_blank(), #remove minor gridlines
-      legend.background = element_rect(fill='transparent'), #transparent legend bg
-      legend.box.background = element_rect(fill='transparent') #transparent legend panel
-    ) 
 
 
-all_mitm_plt
-
-ggsave(filename = here::here("Mariana", "Draft3", "output", "mitm_formal_mediaiton_forest_plots.pdf"),
-       width = 4.5, height = 3, units = "in")
-```
-
-Since all these genes candidate mediators for the relationship between MCINP and BW~adj~, we can also visualize the indirect effects as a forest plot, so we can see which are significant or relatively stronger. 
+Since all these genes candidate mediators for the relationship between MCINP and BW~adj~, we can visualize the indirect effects as a forest plot, so we can see which are significant or relatively stronger. 
 
 ```{r fig.width=2, fig.height=2}
 mediation_res |>
@@ -669,17 +659,17 @@ mediation_res |>
   geom_point(aes(x = Estimate, 
                  y = gene, 
                  color = sig)) +
-  geom_text(aes(x = `95% CI Lower` - 10, ## plot stars off to the left
+  geom_text(aes(x = `95% CI Lower` * 1.1, ## plot stars off to the left
                 y = gene, 
                 label = stars, 
                 color = sig), 
-            size = 6) +
+            size = 5) +
   ## scale formatting
   scale_color_manual(values = c("black", "tomato"), 
                      name = "P < 0.05", 
                      guide = "none") + 
-  scale_x_continuous(breaks = c(-100, 0, 100)) +
-  xlab("Indirect Effect, g") + 
+  # scale_x_continuous(breaks = c(-100, 0, 100)) +
+  xlab("Indirect Effect") + 
   ylab(NULL) +
   theme_classic(base_size = 10) +
   theme(
@@ -694,7 +684,7 @@ mediation_res |>
       legend.box.background = element_rect(fill='transparent') #transparent legend panel
     ) 
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "mitm_formal_mediaiton_CME_forest_plots.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "mitm_formal_mediaiton_CME_forest_plots.pdf"),
        width = 2, height = 2, units = "in")
 ```
 

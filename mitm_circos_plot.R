@@ -19,39 +19,17 @@ phthalate_all <- readr::read_csv(here::here("Mariana/Draft3/CIRCOS_and_MITMmedia
   dplyr::select(-1)
 
 ##### fetal outcomes results 
-load(file = here::here("Mariana", "Draft3", "output", "DEG_SPLINES_results_placentalEfficiency_birthWeight.RData"))
-rm(covar_ratio, Y_norm)
-
-load(file = here::here("Mariana", "Draft3", "output", "DEGs_PW_for_sensitivity_analysis.Rdata"))
+all_outcome <- readr::read_csv(file = here::here("Mariana", "Env Int Revision", "output", "full_BW_PW_ratio_results.csv"))
 
 ## Wrangle data
-outcome_results <- dplyr::bind_rows(
-  
-  ## overall 
-  Results_bw |> 
-    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
-    dplyr::mutate(Track_Sublevel = "BWadj", 
-                  SECTOR = "BWadj",
-                  Track_Analysis = "Overall"),
-  Results_ratio |> 
-    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
-    dplyr::mutate(Track_Sublevel = "BW:PW", 
-                  SECTOR = "BW:PW",
-                  Track_Analysis = "Overall"),
-  Results_pw_spline_N253 |>
-    tibble::as_tibble(rownames = pkgconfig::get_config("tibble::rownames", "ensembl_gene_id")) |>
-    dplyr::mutate(Track_Sublevel = "PW", 
-                  SECTOR = "PW",
-                  Track_Analysis = "Overall",
-                  logFC = NA)
-) |>
-  dplyr::mutate(
-    Track_Analysis = factor(Track_Analysis) |> relevel(ref = "Overall"),
-    Sector = "Outcome"
-  ) |>
-  dplyr::select(genes, 
-                logFC,
-                FDR = adj.P.Val,
+outcome_results <- all_outcome |> 
+    dplyr::mutate(Track_Sublevel = outcome, 
+                  SECTOR = outcome,
+                  Sector = outcome,
+                  Track_Analysis = analysis) |>
+  dplyr::select(genes = gene_symbol, 
+                logFC = coefficient,
+                FDR,
                 Sector, 
                 SECTOR,
                 Track_Sublevel,
@@ -220,18 +198,18 @@ Dat$Color <- map_colors(Dat$logFC)
 gene_sector_counts <- aggregate(Sector ~ genes, data = Dat, FUN = function(x) length(unique(x)))
 shared_across_sectors <- gene_sector_counts$genes[gene_sector_counts$Sector > 1]  # Only keep genes in multiple sectors
 
-sector_y_limits <- rbind(
-  ## Birthweight 
-  c(min(Dat[Dat$Sector == "BWadj", ]$logFC) * 1.05, max(Dat[Dat$Sector == "BWadj", ]$logFC)*1.05),
-  ## BW: PW
-  c(min(Dat[Dat$Sector == "BW:PW", ]$logFC) * 1.05, max(Dat[Dat$Sector == "BW:PW", ]$logFC)*1.05),
-  ## Phthalate
-  c(min(Dat[Dat$Sector == "Phthalate", ]$logFC) * 1.05, max(Dat[Dat$Sector == "Phthalate", ]$logFC)*1.05)
-)
+# sector_y_limits <- rbind(
+#   ## Birthweight 
+#   c(min(Dat[Dat$Sector == "BWadj", ]$logFC) * 1.05, max(Dat[Dat$Sector == "BWadj", ]$logFC)*1.05),
+#   ## BW: PW
+#   c(min(Dat[Dat$Sector == "BW:PW", ]$logFC) * 1.05, max(Dat[Dat$Sector == "BW:PW", ]$logFC)*1.05),
+#   ## Phthalate
+#   c(min(Dat[Dat$Sector == "Phthalate", ]$logFC) * 1.05, max(Dat[Dat$Sector == "Phthalate", ]$logFC)*1.05)
+# )
 
 # Create the heatmap track with only cross-sector shared gene labels
 circos.track(sectors = levels(Dat$Sector),
-             ylim = sector_y_limits, 
+             ylim = c(1.05*min(Dat$logFC), 1.05*max(Dat$logFC)), 
              panel.fun = function(x, y) {
                sector.index <- CELL_META$sector.index
                sector_data <- Dat[Dat$Sector == sector.index, ]

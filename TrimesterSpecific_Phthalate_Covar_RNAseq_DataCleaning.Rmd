@@ -1,0 +1,591 @@
+---
+title: "Phthalate_Covar_RNAseq_DataCleaning_GAPPS_TrimesterSpecific"
+author: "Samantha Lapehn & Alison Paquette & Mariana Parenti"
+date: "06/27/25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Phthalate, Covariate, and RNAseq Data Cleaning- GAPPS
+This code clean covariate data, RNAseq data, and phthalate data for trimester-specific analyses.
+
+### Load packages
+```{r load packages}
+library(tidyverse)
+library(ggVennDiagram)
+library(here)
+library(assertthat)
+library(edgeR)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(kableExtra) 
+library(RUVSeq) 
+library(ggrepel)
+library(corrplot)
+```
+
+
+### Load Data
+```{r load data}
+#Load Exposure Data
+PrenatalExposures<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4-9-2024/req_05_biomarkers.csv")
+
+#Load Covariates
+full_covar<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4_15_2024/req_05_data.csv")
+                        
+rownames(full_covar)<-(full_covar$pathways_id)
+
+## load RNA seq
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/gapps_20240325.Rdata")
+
+### Load BWPW
+
+BWPW<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/intermediateData/all_birthweightZscores_fetalPlacentalRatios.csv")
+
+BWPW$ratio[BWPW$fetal_placental_ratio>15]<-NA
+
+### Load Diff Covar version to include gest age in data cleaning for Table
+GestAge <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/OriginalData/gapps_harmonization.csv")
+GestAge <- GestAge %>%
+  dplyr::select(pathways_id, h_birth_gestage)
+
+```
+
+### Covariate Cleaning
+
+First, we need to attach the RNA-sequencing analysis batch to the covariate data. 
+
+```{r add batch var}
+## attach batches to covar
+## match batches data to pathways_id 
+## code from Alison's CRH analysis in CANDLE 
+## CRH_PreliminaryDataPreprocessing_3102023.Rmd
+batches$pathways_id <- colnames(counts$counts)
+
+covar <- dplyr::full_join(full_covar, 
+                          ## join batches
+                          batches %>% dplyr::select(c(pathways_id, batch = Analysis)),
+                          by = join_by(pathways_id))
+```
+
+Second, we need to remove the `8888` codings for NAs and convert them to `NA` that R can interpret.
+
+```{r update NA coding}
+covar <- covar %>%
+   mutate(across(where(is.numeric), ~ na_if(., 8888)))
+```
+Note, we are not adjusting for hypertension or GDM here.
+
+Now, filter based on exclusion criteria.
+
+```{r filterMissingRNAseq}
+dim(covar)
+
+covar_rnaseq <- covar %>% 
+  ## n = 702
+  dplyr::distinct() %>%
+  ## n = 701
+  ## remove the duplicates in the fourth batch for now (arrange by batch, 
+  ## then take only the first sample)
+  dplyr::arrange(batch) %>%
+  dplyr::group_by(pathways_id) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup() %>%
+  ## n = 673
+  dplyr::filter(pathways_id %in% colnames(lengthScaledTPM$counts)) %>%
+  # n = 465
+  ## also remove multifetal gestations and abruptions
+  dplyr::filter(h_placental_abrupt == 0 | is.na(h_placental_abrupt) == TRUE) %>%
+  ## n = 425; 451 when retaining NAs
+  dplyr::filter(h_multi_gest == 0 | is.na(h_multi_gest) == TRUE) %>%
+  ## n = 413; 438 when retaining NAs
+  ## some issues with unreasonable maternal BMIs (= 0)
+  dplyr::filter(h_m_prepreg_bmi > 0 | is.na(h_m_prepreg_bmi) == TRUE)
+
+dim(covar_rnaseq)
+sum(duplicated(covar_rnaseq$pathways_id))
+```
+
+Now, let's factorize as needed. 
+
+```{r var as factors}
+covar_rnaseq <- within(covar_rnaseq, {
+  protocol <- factor(protocol, labels = c("Old", "New"))
+  mra_protocol <- factor(mra_protocol, labels = c("Old", "New"))
+  site <- factor(site, labels = c("UW", "Swedish", "Yakima"))
+  h_c_sex <- factor(h_c_sex) %>% ## relevel
+    relevel(ref = "M") ## more males than females
+  h_m_race <- factor(h_m_race, labels = c("White", "Black_AA", "Asian",
+                                          "NI_AN", "Multiple", "Other"))
+  race_collapsed <- dplyr::if_else(h_m_race %in% c("NI_AN", "Multiple"), 
+                                   "Other", 
+                                   h_m_race) %>% 
+    factor() %>%
+    relevel(ref = "White")
+  h_m_ethn <- factor(h_m_ethn, labels = c("Not Hispanic", "Hispanic or Latino"))
+  h_m_enroll_educ <- factor(h_m_enroll_educ, labels =  c("<HS", "HS graduate", "Graduated college/technical school", "Some graduate work or degree")) %>% ## college grad is largest group
+    relevel(ref = "Graduated college/technical school")
+  edu_collapsed <- dplyr::if_else(h_m_enroll_educ %in% c("Graduated college/technical school", "Some graduate work or degree"),
+                                  0,  ## college graduate or higher as reference
+                                  1) %>%
+    factor()
+  h_m_enroll_smoke <- factor(h_m_enroll_smoke, labels = c("No", "Yes"))
+  cg_labor_type <- factor(cg_labor_type, labels = c("Spontaneous", "Augmented", "Induced", "No labor"))
+  labor_collapsed <- dplyr::if_else(cg_labor_type == "No labor", 
+                                    "No labor",
+                                    "Labored") %>%
+    factor(levels = c("Labored", "No labor"))
+  h_del_method <- factor(h_del_method, labels = c("Vaginal", "C-section"))
+  batch <- factor(batch)
+  })
+dim(covar_rnaseq)
+sum(duplicated(covar_rnaseq$pathways_id))
+
+### ADd GEstage
+covar_rnaseq <- full_join(covar_rnaseq, GestAge, by=c("pathways_id"))
+dim(covar_rnaseq)
+sum(duplicated(covar_rnaseq$pathways_id))
+```
+
+### Add Smoking 
+```{r smoking and }
+#Smoking- Making a composite variable where any Yes to self-report or any cotinine above threshold=Positive
+Cotinine <- PrenatalExposures %>%
+  dplyr::select(pathways_id, cotinine_yn, phthalate_contact_type)
+Cotinine_T1 <- Cotinine %>%
+  dplyr::filter(phthalate_contact_type=="T1")
+Cotinine_T1 <- Cotinine_T1[-63, ] #There is a duplicate here for one participant with two T1 measurements, but they match so removing one to avoid duplicates later on g1200583
+summary(factor(Cotinine_T1$cotinine_yn)) # No T1 Smokers
+Cotinine_T2 <- Cotinine %>%
+  dplyr::filter(phthalate_contact_type=="T2")
+Cotinine_T2 <- Cotinine_T2[-211, ] #There is a duplicate here for one participant with two T2 measurements, they are a 0 and NA so won't affect the results to remove one g1200502
+summary(factor(Cotinine_T2$cotinine_yn)) # 5 T2 Smokers
+Cotinine_T3 <- Cotinine %>%
+  dplyr::filter(phthalate_contact_type=="T3")
+summary(factor(Cotinine_T3$cotinine_yn)) # 4 T3 Smokers
+#Make Cotinine composite by participant
+Cotinine_T2_T3 <- full_join(Cotinine_T2, Cotinine_T3, by=c("pathways_id"), suffix=c("_T2", "_T3"))
+Cotinine_AllTris<- full_join(Cotinine_T1, Cotinine_T2_T3, by=c("pathways_id"))
+#Change 0s to NA
+Cotinine_AllTris[is.na(Cotinine_AllTris)] <- 0
+Cotinine_AllTris$CotinineComp <- Cotinine_AllTris$cotinine_yn + Cotinine_AllTris$cotinine_yn_T2 + Cotinine_AllTris$cotinine_yn_T3
+summary(factor(Cotinine_AllTris$CotinineComp))
+CotinineComp <- Cotinine_AllTris %>%
+  dplyr::select(pathways_id, CotinineComp)
+covar_rnaseq <- full_join(covar_rnaseq, CotinineComp, by=c("pathways_id"))
+
+covar_rnaseq <- covar_rnaseq %>%
+  dplyr::mutate(smoking_composite = dplyr::case_when(
+  h_m_enroll_smoke == "Yes" ~ 1, ## if self-report, yes
+  (h_m_enroll_smoke == "No" | is.na(h_m_enroll_smoke) == TRUE) & CotinineComp == 1 ~ 1,
+  ## if self-report no or no report but cotinine == yes, yes
+  h_m_enroll_smoke == "No" & (is.na(CotinineComp) == TRUE | CotinineComp == 0) ~ 0,
+  ## if self-report no and cotinine == no or cotinine is NA, no
+  is.na(h_m_enroll_smoke) == TRUE & (is.na(CotinineComp) == TRUE | CotinineComp == 0) ~ NA
+  ## else, everything must be NA, so NA
+))
+
+covar_rnaseq$smoking_composite <- factor(covar_rnaseq$smoking_composite)
+#Check Smoking Results
+Smoking <- covar_rnaseq %>%
+  dplyr::select(h_m_enroll_smoke, CotinineComp, smoking_composite)
+summary(factor(covar_rnaseq$h_m_enroll_smoke))
+summary(factor(covar_rnaseq$CotinineComp))
+summary(factor(covar_rnaseq$smoking_composite))
+
+dim(covar_rnaseq)
+sum(duplicated(Cotinine_AllTris$pathways_id))
+```
+
+### Filter participants missing relevant covariates for each analysis
+
+```{r na omit}
+dim(covar_rnaseq)
+covar_complete <- covar_rnaseq %>%
+                                 dplyr::select(pathways_id, protocol, site, 
+                                               h_c_sex, h_m_delivery_age, 
+                                               race_collapsed, h_m_ethn, 
+                                               edu_collapsed, h_m_prepreg_bmi, 
+                                               parity_20, labor_collapsed, 
+                                               h_del_method, batch, smoking_composite, h_birth_gestage) %>%
+                                 na.omit()
+                              
+
+dim(covar_complete)
+
+```
+
+
+
+
+### Filter for only participants with complete covars and phthalate data
+```{r filter phthalates}
+Phthalate_Data1<-PrenatalExposures[,c(1,4,6,7:79)]
+table(is.na(Phthalate_Data1$phthalate_contact_type))
+Phthalate_Data<-Phthalate_Data1[!is.na(Phthalate_Data1$phthalate_contact_type),]
+
+Phthalate_Data_Covars <- Phthalate_Data %>%
+  dplyr::filter(pathways_id %in% covar_complete$pathways_id)
+
+covar_complete_PHT <- covar_complete %>%
+  dplyr::filter(pathways_id %in% Phthalate_Data$pathways_id)
+
+```
+
+### Split Covariates by Visit
+These are unfiltered IDs by Visit
+```{r split visits}
+#Get IDs by Visit
+Visit_IDs <- Phthalate_Data %>%
+  dplyr::select(pathways_id, phthalate_contact_type)
+T1_Visit <- Visit_IDs %>%
+  dplyr::filter(phthalate_contact_type=="T1")
+T2_Visit <- Visit_IDs %>%
+  dplyr::filter(phthalate_contact_type =="T2")
+T3_Visit <- Visit_IDs %>%
+  dplyr::filter(phthalate_contact_type=="T3")
+
+#Split Covariates
+covar_complete_T1 <- covar_complete_PHT %>%
+  dplyr::filter(pathways_id %in% T1_Visit$pathways_id)
+covar_complete_T2 <- covar_complete_PHT %>%
+  dplyr::filter(pathways_id %in% T2_Visit$pathways_id)
+covar_complete_T3<- covar_complete_PHT %>%
+  dplyr::filter(pathways_id %in% T3_Visit$pathways_id)
+```
+
+### Evaluate exposure data
+```{r evaluate exp data}
+#Compare Histogram of Visits- Updating trimesters here for 0-13w T1, 14-27w=T2, 28w+=T3
+Phthalate_Data_Covars$Trimester<-cut(Phthalate_Data_Covars$gest_age_sample_days,
+               breaks=c(0,7*14,7*28,max(Phthalate_Data_Covars$gest_age_sample_days)),
+               right=T,labels=c("Tri1","Tri2","Tri3"))
+
+T1Visit<-subset(Phthalate_Data_Covars,phthalate_contact_type=="T1")
+table(T1Visit$Trimester)
+
+T2Visit<-subset(Phthalate_Data_Covars,phthalate_contact_type=="T2")
+table(T2Visit$Trimester)
+
+T3Visit<-subset(Phthalate_Data_Covars,phthalate_contact_type=="T3")
+table(T3Visit$Trimester)
+
+hist(T1Visit$gest_age_sample_days,breaks=25,col="darkslategray1",xlim=c(0,300),ylim=c(0,10),main="Gestational Age at Sample collection",xlab="Gestational Age (Days)")
+hist(T2Visit$gest_age_sample_days,breaks=50,col="cyan3",add=T)
+hist(T3Visit$gest_age_sample_days,breaks=50,col="cyan4",add=T)
+abline(v=c(98,196),lwd=4,col="red") #Marking trimesters 
+
+#Venn Diagram to see how many participants have collection at each visit
+T1 <- T1Visit$pathways_id
+T2 <-T2Visit$pathways_id
+T3 <- T3Visit$pathways_id
+T_list <- list(T1, T2, T3)
+ggVennDiagram(T_list, category.names=c("T1", "T2", "T3"))
+
+length(unique(Phthalate_Data_Covars$pathways_id))
+table(Phthalate_Data$phthalate_contact_type)
+table(Phthalate_Data$Trimester)
+
+### Summary of each Visit
+#T1 Visit
+length(T1Visit$gest_age_sample_days)
+summary(T1Visit$gest_age_sample_days)
+#T2 Visit
+length(T2Visit$gest_age_sample_days)
+summary(T2Visit$gest_age_sample_days)
+#T3 Visit
+length(T3Visit$gest_age_sample_days)
+summary(T3Visit$gest_age_sample_days)
+```
+
+
+### Process Phthalates
+Use geometric mean to combine phthalate measures across multiple visits
+```{r process phthalate data}
+### Split Phthalates by Trimester
+Phthalate_T1 <- Phthalate_Data_Covars %>%
+  dplyr::filter(phthalate_contact_type=="T1")
+Phthalate_T2 <- Phthalate_Data_Covars %>%
+  dplyr::filter(phthalate_contact_type=="T2")
+Phthalate_T3 <- Phthalate_Data_Covars %>%
+  dplyr::filter(phthalate_contact_type=="T3")
+
+#These are compounds above the LOD from the combined trimester analysis and the PW IDs column that I want to keep 
+ColsofInterest <- c("mep", "mcpp",  "mehhp", "mbzp",  "mmp", "mehp",  "mhpp",  "mcinp", "mciop", "mbp",   "mibp",  "mecpp", "mcmhp", "mchpp", "meohp","dehp2", "pathways_id")
+  
+#T1
+Phthalate_T1_Clean <- Phthalate_T1[,ColsofInterest]
+sum(duplicated(Phthalate_T1_Clean$pathways_id))
+which(duplicated(Phthalate_T1_Clean$pathways_id))
+#There is one participant with two T1 visits (g1200583)- going to remove this so that it doesn't require additional processing
+Phthalate_T1_Clean <- Phthalate_T1_Clean %>%
+  dplyr::filter(pathways_id != "g1200583")
+sum(duplicated(Phthalate_T1_Clean$pathways_id))
+rownames(Phthalate_T1_Clean) <- Phthalate_T1_Clean$pathways_id
+Phthalate_T1_Clean <- Phthalate_T1_Clean %>%
+  dplyr::select(-pathways_id)
+#T2
+Phthalate_T2_Clean <- Phthalate_T2[,ColsofInterest]
+sum(duplicated(Phthalate_T2_Clean$pathways_id))
+rownames(Phthalate_T2_Clean) <- Phthalate_T2_Clean$pathways_id
+Phthalate_T2_Clean <- Phthalate_T2_Clean %>%
+  dplyr::select(-pathways_id)
+#T3
+Phthalate_T3_Clean <- Phthalate_T3[,ColsofInterest]
+sum(duplicated(Phthalate_T3_Clean$pathways_id))
+rownames(Phthalate_T3_Clean) <- Phthalate_T3_Clean$pathways_id
+Phthalate_T3_Clean <- Phthalate_T3_Clean %>%
+  dplyr::select(-pathways_id)
+
+```
+
+### Boxplot Log Transform Phthalate data by Trimester
+```{r log transform}
+#Summarize Raw Data
+summary_rawdata_T1 <- summary(Phthalate_T1_Clean)
+print(summary_rawdata_T1)
+summary_rawdata_T2 <- summary(Phthalate_T1_Clean)
+print(summary_rawdata_T2)
+summary_rawdata_T3 <- summary(Phthalate_T1_Clean)
+print(summary_rawdata_T3)
+
+ #Log transform- using the default natural log
+Log_PHT_T1<-log(Phthalate_T1_Clean)
+Log_PHT_T2<-log(Phthalate_T2_Clean)
+Log_PHT_T3<-log(Phthalate_T3_Clean)
+    
+#Visualize
+  boxplot(Log_PHT_T1)
+  title(main="T1-Natural Log Transformed Phthalates")
+  boxplot(Log_PHT_T2)
+  title(main="T2-Natural Log Transformed Phthalates")
+  boxplot(Log_PHT_T3)
+  title(main="T3-Natural Log Transformed Phthalates")
+
+```
+
+### Plot Phthalates by Trimester
+```{r plot by Tri}
+T1_forplot <- Log_PHT_T1 %>%
+  pivot_longer(cols = colnames(Log_PHT_T1),
+               names_to = "Phthalate",
+               values_to = "Value")
+T1_forplot$Trimester <- "1st Trimester"
+
+T2_forplot <- Log_PHT_T2 %>%
+  pivot_longer(cols = colnames(Log_PHT_T2),
+               names_to = "Phthalate",
+               values_to = "Value")
+T2_forplot$Trimester <- "2nd Trimester"
+
+T3_forplot <- Log_PHT_T3 %>%
+  pivot_longer(cols = colnames(Log_PHT_T3),
+               names_to = "Phthalate",
+               values_to = "Value")
+T3_forplot$Trimester <- "3rd Trimester"
+
+#Combine
+All_forplot <- rbind(T1_forplot, T2_forplot, T3_forplot) %>%
+  mutate(Phthalate = fct_reorder(Phthalate, -Value, .fun = median, na.rm = TRUE))
+
+#Plot
+ggplot(All_forplot, aes(x=Phthalate, y=Value, fill=Trimester)) + 
+  geom_boxplot()+
+  theme_bw() + 
+  ylab("Natural Log Phthalate Concentration (ng/mL)")
+```
+
+### Process Specific Gravity
+Add SG Data to each covariate set
+```{r process SG data}
+#Pull Only SG  Data
+SGData <-Phthalate_Data %>%
+  dplyr::select(pathways_id, sg, phthalate_contact_type)
+SGData_T1 <- SGData %>%
+  dplyr::filter(phthalate_contact_type=="T1") %>%
+  dplyr::filter(pathways_id %in% rownames(Phthalate_T1_Clean))
+
+SGData_T2 <- SGData %>%
+  dplyr::filter(phthalate_contact_type=="T2") %>%
+  dplyr::filter(pathways_id %in% rownames(Phthalate_T2_Clean))
+
+SGData_T3 <- SGData %>%
+  dplyr::filter(phthalate_contact_type=="T3") %>%
+  dplyr::filter(pathways_id %in% rownames(Phthalate_T3_Clean))
+
+#ADd to each covar set
+covar_complete_T1 <- right_join(covar_complete_T1, SGData_T1, by=c("pathways_id"))
+covar_complete_T2 <- right_join(covar_complete_T2, SGData_T2, by=c("pathways_id"))
+covar_complete_T3 <- right_join(covar_complete_T3, SGData_T3, by=c("pathways_id"))
+
+
+```
+
+### RNA Sequencing Cleaning
+June 2025 Update for Split Visits: For RNA Sequencing Cleaning, I'm going to clean the data with all participants together then split into T1, T2, and T3 subsets so that the number of genes is the same across the board. 
+
+Start by removing the duplicated sample and the NovoSeq results from the samples that were run on both instruments, using length scaled TPM values.
+
+```{r pull data}
+## remove the batch 4 duplicates
+LS_Counts <- lengthScaledTPM$counts[, -ind[[2]]]
+
+## check if duplicated names
+colnames(LS_Counts)[duplicated(colnames(LS_Counts))]
+dim(LS_Counts)
+
+## remove duplicate
+LS_Counts <- LS_Counts[, -which(duplicated(colnames(LS_Counts)))]
+
+## confirm duplicate removed
+colnames(LS_Counts)[duplicated(colnames(LS_Counts))]
+dim(LS_Counts)
+```
+
+We will follow these steps in this order. 
+
+1. Remove participants that don't have full covariate data
+2. Removed Enzembl IDs with the suffix "_PAR_Y"  
+3. Remove non-protein coding genes
+4. Performed Filtering on genes with mean cpm<0  
+5. Removed Duplicated Genes  
+6. TMM Normalization 
+
+```{r filtering}
+## Original Dimensions
+dim(LS_Counts)
+dim(annot)
+
+## Retain only complete cases (using covar_ratio) ####
+LS_Counts <- LS_Counts[, covar_complete_PHT$pathways_id]
+
+## Dimensions after filtering for complete cases
+dim(LS_Counts)
+
+## Remove Ensembl IDs with the suffix "_PAR_Y" ####
+LS_Counts <- LS_Counts[!grepl("_PAR_Y", rownames(LS_Counts)), ]
+annot$ENSEMBL <- as.character(annot$ENSEMBL)
+annot <- annot[!grepl("_PAR_Y",annot$ENSEMBL), ]
+
+## Dimsenions after "_PAR_Y" removal
+dim(LS_Counts)
+dim(annot)
+
+## get rownames of count dataset to match annot$ENSEMBL by removing the "." and 
+## everything after it
+rownames(LS_Counts) <- gsub("\\..*", "", rownames(LS_Counts))
+
+## Retain only protein coding genes ####
+## filter the annot file
+annot <- subset(annot, BIOTYPE == "protein_coding") %>%
+  droplevels()
+
+## then filter based on what remains in annotation file
+LS_Counts <- LS_Counts[as.character(annot$ENSEMBL), ]
+
+## Dimensions retaining only protein coding genes
+dim(LS_Counts)
+dim(annot)
+
+## Remove genes with low expression ####
+## Keep genes with average log cpm>0
+logcpm <- cpm(LS_Counts, log = T)
+
+keep <- rowMeans(logcpm) > 0
+summary(keep)
+
+logcpm_filt <- logcpm[keep, ]
+LS_Counts_filt<-LS_Counts[keep, ]
+annot <- annot[keep, ]
+
+## Plot before and after filtering out low expressing genes
+
+plot(density(logcpm), main = "Before Removing low expressing genes")
+abline(v = 0, col = "red", lty = 2)
+
+plot(density(logcpm_filt), main = "After Removing low expressing genes")
+abline(v = 0, col = "red", lty = 2)
+
+## Dimensions after low expression filtering
+dim(LS_Counts_filt)
+dim(annot)
+dim(logcpm_filt)
+
+## Remove duplicated genes ####
+summary(duplicated(logcpm_filt))
+
+dupgenes <-as.character(annot[annot$ENSEMBL %in% rownames(logcpm_filt)[duplicated(logcpm_filt)], "SYMBOL"])
+dupgenes
+
+annot<-annot[-which(annot$SYMBOL%in%dupgenes),]
+logcpm_filt<-logcpm_filt[-which(duplicated(logcpm_filt)),]
+LS_Counts_filt<-LS_Counts_filt[-which(duplicated(LS_Counts_filt)),]
+
+## Dimensions after removing duplicates
+dim(LS_Counts_filt)
+dim(logcpm_filt)
+dim(annot)
+```
+
+### Filter RNAseq for Each Trimester
+```{r filter by tri for rnaseq}
+Counts_filt_T1 <- LS_Counts_filt[, colnames(LS_Counts_filt) %in% covar_complete_T1$pathways_id]
+dim(Counts_filt_T1)
+Counts_filt_T2 <- LS_Counts_filt[, colnames(LS_Counts_filt) %in% covar_complete_T2$pathways_id]
+dim(Counts_filt_T2)
+Counts_filt_T3 <- LS_Counts_filt[, colnames(LS_Counts_filt) %in% covar_complete_T3$pathways_id]
+dim(Counts_filt_T3)
+
+```
+
+Then conduct TMM normalization for each trimester
+
+```{r TMM Norm}
+#Make DGEList
+Y_T1 <- DGEList(counts = Counts_filt_T1, genes = annot$SYMBOL)
+Y_norm_T1 <- calcNormFactors(Y_T1, method = "TMM") #This is the Default Method
+
+Y_T2 <- DGEList(counts = Counts_filt_T2, genes = annot$SYMBOL)
+Y_norm_T2 <- calcNormFactors(Y_T2, method = "TMM") #This is the Default Method
+
+Y_T3 <- DGEList(counts = Counts_filt_T3, genes = annot$SYMBOL)
+Y_norm_T3 <- calcNormFactors(Y_T3, method = "TMM") #This is the Default Method
+
+#Plot before and after normalization- Example form T1
+boxplot(cpm(Y_T1 ,log = T)[, 1:10], main = "Before Normalization")
+
+boxplot(cpm(Y_norm_T1, log = T)[, 1:10], main = "After Normalization")
+```
+
+### Summarize Final Covariates
+```{r summarize final covar}
+summary(covar_complete_T1)
+summary(covar_complete_T2)
+summary(covar_complete_T3)
+```
+
+### Save Data
+```{r save}
+#Raw Phthalate Data
+#write.csv(Phthalate_T1_Clean,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_RawPhthalates_N49_062725.csv")
+#write.csv(Phthalate_T2_Clean,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T2_RawPhthalates_N139_062725.csv")
+#write.csv(Phthalate_T3_Clean,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T3_RawPhthalates_N189_062725.csv")
+
+#Natural Log Phthalate Data
+#write.csv(Log_PHT_T1,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_NaturalLogPhthalates_N49_062725.csv")
+#write.csv(Log_PHT_T2,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T2_NaturalLogPhthalates_N139_062725.csv")
+#write.csv(Log_PHT_T3,"/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T3_NaturalLogPhthalates_N189_062725.csv")
+
+#Covariates
+#save(covar_complete_T1, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_Covariates_N49_062725.RData")
+#save(covar_complete_T2, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T2_Covariates_N139_062725.RData")
+#save(covar_complete_T3, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T3_Covariates_N189_062725.RData")
+
+#RNAseq Data
+#save(Y_norm_T1, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T1_FilteredNormalizedRNAseq_N49_062725.RData")
+#save(Y_norm_T2, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T2_FilteredNormalizedRNAseq_N139_062725.RData")
+#save(Y_norm_T3, file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/SplitVisits/T3_FilteredNormalizedRNAseq_N189_062725.RData")
+```
+

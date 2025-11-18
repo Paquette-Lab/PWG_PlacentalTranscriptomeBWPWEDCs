@@ -4,6 +4,8 @@ author: "Samantha Lapehn & Mariana Parenti"
 output: html_document
 ---
 
+20251015 - Updates to improve visualizations: scale both placental efficiency measures. 
+
 ## Aims 
 
 a) Generate the WGCNA dotplot, showing the WGCNA modules associated with the phthalate metabolites, DEHP, and the mixture, as well as BW~adj~ and BW:PW ratio. 
@@ -21,7 +23,7 @@ library(ggtext)
 ```{r load results}
 sig_PHT <- read_csv(here::here("Mariana", "Draft3", "MITM_WGCNA_Figure", "SigWGCNA_071025.csv"))[, -1]
 
-BW_PE_modules <- read_csv(here::here("Mariana", "Draft3", "MITM_WGCNA_Figure", "WGCNA_sigResults_SPLINES_060525.csv"))
+BW_PE_modules <- read_csv(here::here("Mariana", "Env Int Revision", "output", "WGCNA_bw_ratio_fullResults.csv"))
 
 mixtures_res <- read_csv(here::here("Mariana", "Draft3", "MITM_WGCNA_Figure", "GAPPS_Phthalate_WGCNA_QGComp_SigResults_071025.csv"))[, -1] |>
   ## select and rename columns
@@ -44,17 +46,18 @@ sig_PHT <- sig_PHT |>
   dplyr::rename(analysis = phthalate) |>
   dplyr::bind_rows(mixtures_res)
 
-BW_PE_modules <- BW_PE_modules[, c(2, 1, 3:6)]
+BW_PE_modules <- BW_PE_modules |>
+  dplyr::filter(p.value<0.05)
 
-All_modules <- rbind(sig_PHT, BW_PE_modules)
+All_modules <- dplyr::bind_rows(sig_PHT, BW_PE_modules)
 
 All_modules <- All_modules |>
-  mutate(analysis = ifelse(analysis == "Birthweight", "BW(adj)", analysis))
+  mutate(analysis = ifelse(analysis == "BW~adj~", "BW(adj)", analysis))
 ```
 
 ## Make Summary Dot Plot
 
-```{r DotPlot, fig.width=8, fig.height=6}
+```{r DotPlot, fig.width=8, fig.height=8}
 levels(as.factor(All_modules$module)) |> dput()
 
 # Module <- c(black="black", blue="blue", brown="chocolate4", 
@@ -82,28 +85,39 @@ Module <- c(black = "black", blue = "blue", brown = "chocolate4", cyan = "cyan3"
 analysis_order <- c("BW:PW", "BW(adj)", "DEHP", "MBP", "MBZP", "MCHPP", "MCINP", 
                     "MCIOP", "MCMHP", "MCPP", "MECPP", "MEHHP", "MEHP", "MEOHP", 
                     "MEP", "MHPP", "MIBP", "MMP", "Mixture")
-
-ggplot(All_modules |> 
-         dplyr::mutate(analysis = factor(analysis, levels = analysis_order)), 
-       aes(x=analysis, y=module, fill = estimate)) + 
-  labs(color = "Effect Estimate") +
+All_modules |> 
+         dplyr::mutate(analysis = factor(analysis, levels = analysis_order)) |>
+  ggplot() +
+  aes(x=analysis, 
+      y=module, 
+      fill = estimate) + 
+  ## labels
+  labs(color = "Effect Estimate",
+       size="Abs(Effect Estimate)",
+       y = "Module", 
+       x="Analysis") +
+  ## data
   geom_point(
     aes(size = abs(estimate)),
-    shape = 21, color = "black", stroke = 0.2) +
-  labs(size="Abs(Effect Estimate)") +
+    shape = 21, 
+    color = "black", 
+    stroke = 0.2) +
   theme_bw() + 
-labs(y = "Module", x="Analysis")+
-    scale_fill_gradient2(midpoint=0, 
-                        low="#0092B3", mid="White", high="#F09062", 
-                        name = "Effect Estimate") +
+  ## scales
+  scale_fill_gradient2(midpoint=0, 
+                       low="#0092B3", 
+                       mid="White", 
+                       high="#F09062") +
   guides(size = guide_legend(override.aes = list(fill = "black"))) +
+  ## themes
+  theme_bw() + 
   theme(
     axis.text.x = element_markdown(angle=45, size=12, hjust=1),
     axis.text.y=element_text(size=12, color = Module, face = "bold"), 
     legend.text=element_text(size=12), 
     axis.title= element_text(size=14)) 
 
-ggsave(filename = "MITM_WGCNA_dotplot_20250710.pdf", path = here::here("Mariana", "Draft3", "output"), width = 8, height = 8, units = "in")
+ggsave(filename = "MITM_WGCNA_dotplot_20250710.pdf", path = here::here("Mariana", "Env Int Revision", "output"), width = 8, height = 8, units = "in")
 ```
 
 ## Pathway Enrichment in the WGCNA modules
@@ -181,6 +195,6 @@ pathway_plot_ordered <- pathdata |>
 
 pathway_plot_ordered
 
-ggsave(filename = here::here("Mariana", "Draft3", "output", "wgcnaModulePathways_MITA_transparent.pdf"),
+ggsave(filename = here::here("Mariana", "Env Int Revision", "output", "wgcnaModulePathways_MITA_transparent.pdf"),
        width = 5.5, height = 11, units = "in")
 ```

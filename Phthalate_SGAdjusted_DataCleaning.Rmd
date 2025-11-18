@@ -1,0 +1,297 @@
+---
+title: "Phthalate_Cleaning_GAPPS_SGAdjusted"
+author: "Samantha Lapehn & Alison Paquette & Mariana Parenti"
+date: "09/25/25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Phthalate Cleaning GAPPS
+Cleaning phthalates adjusted for specific gravity here to be use in the Phthalate summary table and phthalate box plot. The models will use values not adjusted for specific gravity but include specific gravity as a covariate.
+
+### Load packages
+```{r load packages}
+library(tidyverse)
+library(ggVennDiagram)
+library(here)
+library(assertthat)
+library(edgeR)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(kableExtra) 
+library(RUVSeq) 
+library(ggrepel)
+library(corrplot)
+library(ggvenn)
+```
+
+
+### Load Data
+```{r load data}
+#Load Exposure Data
+PrenatalExposures<-read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Resubmission_July2024/NEW_RawData/PWG_CovariatePull_4-9-2024/req_05_biomarkers.csv")
+
+#Load Final Covariates that have already been filtered
+load("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FinalCovariates_N222_041525.Rdata")
+                        
+rownames(covar_final)<-covar_final$pathways_id
+
+## load RNA seq
+load(file="/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/FilteredNormalizedRNAseq_N222_041525.RData")
+```
+
+## Prepare Phthalate Data
+In this version we will be preparing the SG adjusted data for plotting/tables.
+
+### Filter for only participants with complete covars
+```{r filter phthalates}
+Phthalate_Data1<-PrenatalExposures[,c(1,4,6,7, 30:38, 40:60, 62:73, 77)]
+table(is.na(Phthalate_Data1$phthalate_contact_type))
+Phthalate_Data<-Phthalate_Data1[!is.na(Phthalate_Data1$phthalate_contact_type),]
+
+Phthalate_Data_Covars <- Phthalate_Data %>%
+  dplyr::filter(pathways_id %in% covar_final$pathways_id)
+
+```
+
+### Evaluate exposure data
+```{r evaluate exp data}
+#Compare Histogram of Visits- Updating trimesters here for 0-13w T1, 14-27w=T2, 28w+=T3
+Phthalate_Data_Covars$Trimester<-cut(Phthalate_Data_Covars$gest_age_sample_days,
+               breaks=c(0,7*14,7*28,max(Phthalate_Data_Covars$gest_age_sample_days)),
+               right=T,labels=c("Tri1","Tri2","Tri3"))
+
+T1Visit<-subset(Phthalate_Data_Covars,phthalate_contact_type=="T1")
+table(T1Visit$Trimester)
+
+T2Visit<-subset(Phthalate_Data_Covars,phthalate_contact_type=="T2")
+table(T2Visit$Trimester)
+
+T3Visit<-subset(Phthalate_Data_Covars,phthalate_contact_type=="T3")
+table(T3Visit$Trimester)
+
+hist(T1Visit$gest_age_sample_days,breaks=25,col="gold",xlim=c(0,300),ylim=c(0,10),main="Gestational Age at Sample collection",xlab="Gestational Age (Days)")
+hist(T2Visit$gest_age_sample_days,breaks=50,col="#F8766D",add=T)
+hist(T3Visit$gest_age_sample_days,breaks=50,col="#00BA38",add=T)
+abline(v=c(98,196),lwd=4,col="black") #Marking trimesters 
+
+#Venn Diagram to see how many participants have collection at each visit
+T1 <- T1Visit$pathways_id
+T2 <-T2Visit$pathways_id
+T3 <- T3Visit$pathways_id
+T_list <- list(
+  "1st Trimester" = T1Visit$pathways_id,
+  "2nd Trimester" = T2Visit$pathways_id,
+  "3rd Trimester" = T3Visit$pathways_id
+)
+ggVennDiagram(T_list, category.names=c("T1", "T2", "T3"))
+ggvenn(data=T_list, show_percentage=FALSE, text_size=10,fill_color = c("gold", "#F8766D", "#00BA38"), fill_alpha = 0.7, set_name_size=9)
+
+length(unique(Phthalate_Data_Covars$pathways_id))
+table(Phthalate_Data$phthalate_contact_type)
+table(Phthalate_Data$Trimester)
+
+### Summary of each Visit
+#T1 Visit
+length(T1Visit$gest_age_sample_days)
+summary(T1Visit$gest_age_sample_days)
+#T2 Visit
+length(T2Visit$gest_age_sample_days)
+summary(T2Visit$gest_age_sample_days)
+#T3 Visit
+length(T3Visit$gest_age_sample_days)
+summary(T3Visit$gest_age_sample_days)
+```
+
+
+### Process Phthalates
+Use geometric mean to combine phthalate measures across multiple visits
+```{r process phthalate data}
+#Pull Only Phthalate Data
+PhthalateOnlyData <-Phthalate_Data_Covars[, c(1, 26:47) ]
+
+gm_mean <- function(a) {
+  prod(a, na.rm = TRUE)^(1/length(a))
+}
+
+# Extract the grouping variable (pathways_id)
+Gapps_IDs <- PhthalateOnlyData$pathways_id
+
+# Aggregate using geomtric mean
+PHT_Av <- aggregate(PhthalateOnlyData[, -which(names(PhthalateOnlyData) == "pathways_id")], 
+                     by = list(pathways_id = Gapps_IDs), 
+                     FUN = gm_mean)
+
+rownames(PHT_Av)<-PHT_Av$pathways_id
+
+#Pull Only LOD Data
+LODs <-Phthalate_Data_Covars[, c(1, 5:25) ]
+#Aggregate LODs as arithmetic averages
+LODs_Agg <-aggregate(LODs[, -which(names(LODs) == "pathways_id")], 
+                     by = list(pathways_id = Gapps_IDs), 
+                     FUN = mean)
+rownames(LODs_Agg) <- LODs_Agg$pathways_id
+LODs_Agg <- LODs_Agg %>%
+  dplyr::select(-pathways_id)
+LODs_Factors <- sapply(LODs_Agg, as.factor)
+Table<-data.frame(matrix(NA,nrow=21,ncol=5))
+  colnames(Table)<-c("Total_0","Total_0.33", "Total_0.5", "Total_0.67", "Total_1")
+  for(i in 1:21){
+    Table[i,1]<-sum(LODs_Factors[,i]==0)
+    Table[i,2]<-sum(LODs_Factors[,i]=="0.333333333333333"
+)
+     Table[i,3]<-sum(LODs_Factors[,i]==0.5
+)
+      Table[i,4]<-sum(LODs_Factors[,i]=="0.666666666666667"
+)
+    Table[i,5]<-sum(LODs_Factors[,i]==1)
+  }
+  rownames(Table)<-colnames(LODs_Factors)
+  Table$SumParticipants <- (Table$Total_0 + Table$Total_0.5 + Table$Total_0.33 + Table$Total_0.67 + Table$Total_1)
+  print(Table)
+  
+  Cutoff<-dim(LODs_Agg)[1]*0.7 # only retaining compounds with at least 70% of participants above LOD
+  
+ # Remove Samples Below LOD
+  BelowLOD<-rownames(Table)[which(Table[,1]<Cutoff)]  #These Are the sample swe are removing
+  print(BelowLOD)
+  
+  AboveLOD<-rownames(Table)[which(Table[,1]>Cutoff)]  #Samples We will retain
+  AboveLOD <- str_replace(AboveLOD, "_lod$", "_adj")
+  
+   PHT<-PHT_Av[,AboveLOD]
+  rownames(PHT)<-rownames(PHT_Av)
+  colnames(PHT) <- str_remove(colnames(PHT), "_adj")
+  
+  # Need to add dehp back since it doesn't have an LOD
+  #First check that dataframes are in same order
+  sum(rownames(PHT)==rownames(PHT_Av))
+  PHT$dehp <- PHT_Av$dehp2_adj
+
+```
+
+### Summarize Phthalte Data and Log Transform Phthalate data
+```{r log transform}
+#Plot raw values
+boxplot(PHT, Title="Raw Phthalates (Average)- SG Adjusted")
+
+#Summarize Raw Data
+summary_rawdata <- summary(PHT)
+print(summary_rawdata)
+
+ #Log transform and visualize
+    Log_PHT<-log(PHT) #the default is a natural log transformation
+   boxplot(Log_PHT,Title="Log Phthalates (Geometric Mean)- SG Adjusted") 
+
+```
+
+### Make Phthalate Box Plots
+```{r box plot phthalates}
+#Step 1: Reorder dataframe by Median
+PHT_sorted <-Log_PHT[order(-sapply(Log_PHT, median))]
+colnames(PHT_sorted) <- toupper(colnames(PHT_sorted))
+#Step 2: Make Boxplot
+boxplot(PHT_sorted, cex.axis=1, col="dodgerblue4", ylim=c(-5,10), ylab="Natural Log Phthalate Concentration (ng/mL)- SG Adjusted")
+stripchart(PHT_sorted,              # Data
+           method = "jitter", # Random noise
+           jitter=0.25,
+           pch = 20, 
+           cex=0.03,# Pch symbol
+           col = "grey34",           # Color of the symbol
+           add = TRUE, 
+           vertical=TRUE)
+
+```
+
+### Make Phthalate Correlation Plots
+This is using the pearson correlation which is default for corrplot on the log transformed phthalate data. 
+Note: To move asterisks above numbers run the trace line below then edit line 443 to include +0.35 after sig.locs
+trace(corrplot, edit=T)
+```{r phthalate corr plots}
+corrtest <- cor.mtest(PHT_sorted, conf.level = .95)
+corrplot(cor(PHT_sorted),type="lower", method="color",order = "hclust", p.mat = corrtest$p,  addCoef.col = "black",insig = "label_sig", pch.cex=2, pch.col="red", number.cex=0.75, tl.col="black")
+
+```
+
+### Check Trimesters for each compound
+```{r}
+LODs_AllData<-Phthalate_Data[,grep("_lod", colnames(Phthalate_Data))]
+LODs_AllData <- sapply(LODs_AllData, as.factor)
+LODs_AllData <- data.frame(LODs_AllData)
+LODs_AllData$phthalate_contact_type <- Phthalate_Data$phthalate_contact_type
+LODs_AllData$pathways_id<- Phthalate_Data$pathways_id
+Participants223 <- covar_final$pathways_id
+T1_LODs <- LODs_AllData %>%
+  dplyr::filter(phthalate_contact_type=="T1") 
+T1_LODs <- T1_LODs %>%
+  dplyr::filter(T1_LODs$pathways_id %in% Participants223) %>%
+  dplyr::select(-pathways_id, -phthalate_contact_type)
+T1_LODs <- mutate_if(T1_LODs, is.character, as.factor)
+summary(T1_LODs)
+T1_LOD_Summary <- summary(T1_LODs)
+
+T2_LODs <- LODs_AllData %>%
+  dplyr::filter(phthalate_contact_type=="T2") 
+T2_LODs <- T2_LODs %>%
+  dplyr::filter(T2_LODs$pathways_id %in% Participants223)%>%
+  dplyr::select(-pathways_id, -phthalate_contact_type)
+T2_LODs <- mutate_if(T2_LODs, is.character, as.factor)
+summary(T2_LODs)
+T2_LOD_Summary <- summary(T2_LODs)
+
+T3_LODs <- LODs_AllData %>%
+  dplyr::filter(phthalate_contact_type=="T3") 
+T3_LODs <- T3_LODs %>%
+  dplyr::filter(T3_LODs$pathways_id %in% Participants223)%>%
+  dplyr::select(-pathways_id, -phthalate_contact_type)
+T3_LODs <- mutate_if(T3_LODs, is.character, as.factor)
+summary(T3_LODs)
+T3_LOD_Summary <- summary(T3_LODs)
+
+```
+
+
+## Plot phthalates by Site
+```{r}
+PHT_forPlot <- stack(Log_PHT)
+PHT_forPlot$pathways_id <- rep(rownames(Log_PHT), times = ncol(PHT))
+
+Sites <- covar_final %>%
+  dplyr::select(pathways_id, site)
+
+PHT_Sites <- inner_join(PHT_forPlot, Sites, by=c("pathways_id"))
+
+PHT_Sites <- PHT_Sites %>%
+  mutate(city = recode(site, "UW" = "Seattle", "Swedish" = "Seattle", "Yakima" = "Yakima"))
+
+colnames(PHT_Sites) <- c("LogConc", "Phthalate", "pathways_id", "Site", "City")
+
+PHT_Sites$Phthalate <- reorder(PHT_Sites$Phthalate, PHT_Sites$LogConc, fun=median, decreasing=TRUE)
+
+PHT_Sites$Phthalate <- toupper(PHT_Sites$Phthalate)
+
+ggplot(PHT_Sites, aes(x=Phthalate, y=LogConc, fill=Site)) +
+  geom_boxplot() + 
+  theme_bw() + 
+  ylab("Natural Log Concentration (ng/mL) - SG Adjusted") + 
+  xlab("Phthalate Metabolite") + 
+  ggtitle("Phthalate Concentration by Site")
+
+ggplot(PHT_Sites, aes(x=Phthalate, y=LogConc, fill=City)) +
+  geom_boxplot() + 
+  theme_bw() + 
+  ylab("Natural Log Concentration (ng/mL)- SG Adjusted") + 
+  xlab("Phthalate Metabolite") + 
+  ggtitle("Phthalate Concentration by City")
+```
+
+### Save Data
+```{r save}
+#write.csv(summary_rawdata, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/Phthalate_RawDataSummary_GeoMean_SGAdjuated_N222_092325.csv")
+#write.csv(PHT, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/Phthalate_CleanedRawData_GeoMean_SGAdjusted_N222_092325.csv")
+#write.csv(Log_PHT, "/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/Phthalate_CleanedLogData_GeoMean_LN_SGAdjusted_N222_092325.csv")
+
+```
+

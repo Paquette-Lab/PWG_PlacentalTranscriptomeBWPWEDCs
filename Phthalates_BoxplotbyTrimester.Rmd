@@ -1,0 +1,99 @@
+---
+title: "BoxplotbyTrimester_Phthalates"
+author: "Samantha Lapehn"
+date: "2025-09-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Boxplot of Phthalates by Trimester
+Making a boxplot of phthalate natural log concentrations for each trimester and Geometric Mean using the specific gravity adjusted phthalates. 
+
+### Load Packages
+```{r load packages}
+library(tidyverse)
+```
+
+### Load Data
+Note: there is one participant in the GM data that was excluded from the T1 data since there were two T1 measurements. 
+```{r load data}
+T1 <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/T1_NaturalLogPhthalates_N49_SGAdjusted_092325.csv")
+T2 <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/T2_NaturalLogPhthalates_N139_SGAdjusted_092325.csv")
+T3 <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/T3_NaturalLogPhthalates_N189_SGAdjusted_092325.csv")
+GM <- read.csv("/Volumes/paquette_a/GAPPSGrant_PrelimData/Sam/Data/RevisionUpdates/Phthalate_CleanedLogData_GeoMean_LN_SGAdjusted_N222_092325.csv")
+```
+
+### Organize Data
+```{r organize}
+#Clean up GM Data
+GM <- GM %>%
+  dplyr::select(-X)
+colnames(GM) <- toupper(colnames(GM))
+names(GM)[names(GM) == 'DEHP2'] <- 'DEHP'
+
+#Clean up T1,2,3 Data
+T1 <- T1 %>%
+  dplyr::select(-X)
+colnames(T1) <- toupper(colnames(T1))
+names(T1)[names(T1) == 'DEHP2'] <- 'DEHP'
+
+T2 <- T2 %>%
+  dplyr::select(-X)
+colnames(T2) <- toupper(colnames(T2))
+names(T2)[names(T2) == 'DEHP2'] <- 'DEHP'
+
+T3 <- T3 %>%
+  dplyr::select(-X)
+colnames(T3) <- toupper(colnames(T3))
+names(T3)[names(T3) == 'DEHP2'] <- 'DEHP'
+
+```
+
+### Plot Phthalates by Trimester
+```{r plot by Tri}
+T1_forplot <- T1 %>%
+  pivot_longer(cols = colnames(T1),
+               names_to = "Phthalate",
+               values_to = "Value")
+T1_forplot$Group <- "1st Trimester"
+
+T2_forplot <- T2 %>%
+  pivot_longer(cols = colnames(T2),
+               names_to = "Phthalate",
+               values_to = "Value")
+T2_forplot$Group <- "2nd Trimester"
+
+T3_forplot <- T3 %>%
+  pivot_longer(cols = colnames(T3),
+               names_to = "Phthalate",
+               values_to = "Value")
+T3_forplot$Group <- "3rd Trimester"
+
+GM_forplot <- GM %>%
+  pivot_longer(cols=colnames(GM), 
+               names_to = "Phthalate", 
+               values_to= "Value")
+GM_forplot$Group <- "Geometric Mean"
+
+#Combine
+All_forplot <- rbind(T1_forplot, T2_forplot, T3_forplot, GM_forplot) %>%
+  mutate(Phthalate = fct_reorder(Phthalate, -Value, .fun = median, na.rm = TRUE))
+
+#Plot
+ggplot(All_forplot, aes(x=Phthalate, y=Value, fill=Group)) + 
+  geom_boxplot()+
+  theme_bw() + 
+  ylab("Natural Log Phthalate Concentration (ng/mL)- Specific Gravity Adjusted") + 
+  scale_fill_manual(values = c(
+    "1st Trimester" = "gold", 
+    "2nd Trimester" = "#F8766D", 
+    "3rd Trimester" = "#00BA38", 
+    "Geometric Mean" = "#619CFF"
+  ))
+```
+
